@@ -501,6 +501,18 @@ if(LIBSRTP_TEST_APPS)
     target_include_directories(rcc_test PRIVATE test)
     target_link_libraries(rcc_test srtp3)
     add_test(rcc_test rcc_test)
+
+    add_executable(replay_guard_test test/replay_guard_test.c test/util.c)
+    target_set_warnings(
+            TARGET
+            replay_guard_test
+            ENABLE
+            ${ENABLE_WARNINGS}
+            AS_ERRORS
+            ${ENABLE_WARNINGS_AS_ERRORS})
+    target_include_directories(replay_guard_test PRIVATE test)
+    target_link_libraries(replay_guard_test srtp3)
+    add_test(replay_guard_test replay_guard_test)
   endif()
 
   find_program(BASH_PROGRAM bash)
