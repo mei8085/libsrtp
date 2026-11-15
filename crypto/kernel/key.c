@@ -88,3 +88,27 @@ srtp_key_event_t srtp_key_limit_update(srtp_key_limit_t key)
     }
     return srtp_key_event_soft_limit;
 }
+
+/*
+ * srtp_key_limit_rollback is the inverse of srtp_key_limit_update() for a
+ * packet that failed after its usage count was consumed.  It restores the
+ * remaining count and resets the state machine to the band that count belongs
+ * to, undoing a soft-limit transition as well as a hard-limit expiry so the
+ * rejected packet neither shortens key lifetime nor leaves an otherwise
+ * usable key marked expired.  A NULL limit (key limiting disabled) is a no-op.
+ */
+void srtp_key_limit_rollback(srtp_key_limit_t key)
+{
+    if (key == NULL) {
+        return;
+    }
+
+    key->num_left++;
+    if (key->num_left >= soft_limit) {
+        key->state = srtp_key_state_normal;
+    } else if (key->num_left < 1) {
+        key->state = srtp_key_state_expired;
+    } else {
+        key->state = srtp_key_state_past_soft_limit;
+    }
+}

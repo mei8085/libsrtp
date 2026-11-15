@@ -68,6 +68,15 @@ srtp_err_status_t srtp_key_limit_clone(srtp_key_limit_t original,
 
 srtp_key_event_t srtp_key_limit_update(srtp_key_limit_t key);
 
+/*
+ * srtp_key_limit_rollback reverses one earlier srtp_key_limit_update()
+ * call whose packet processing ultimately failed.  It restores the usage
+ * count and the limit state machine so that a rejected packet neither
+ * consumes key lifetime nor can push an otherwise usable key into its
+ * soft/hard limit state.  Must be called at most once per update() call.
+ */
+void srtp_key_limit_rollback(srtp_key_limit_t key);
+
 typedef enum {
     srtp_key_state_normal,
     srtp_key_state_past_soft_limit,

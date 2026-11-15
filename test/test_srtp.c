@@ -68,6 +68,7 @@
 void srtp_calc_aead_iv_srtcp_all_zero_input_yield_zero_output(void);
 void srtp_calc_aead_iv_srtcp_seq_num_over_0x7FFFFFFF_bad_param(void);
 void srtp_calc_aead_iv_srtcp_distinct_iv_per_sequence_number(void);
+void srtp_key_limit_rollback_restores_count_and_state(void);
 #ifdef MBEDTLS
 void srtp_hmac_mbedtls_reinit_does_not_leak_key(void);
 void srtp_hmac_mbedtls_init_failure_returns_srtp_status(void);
@@ -87,6 +88,8 @@ TEST_LIST = { { "srtp_calc_aead_iv_srtcp_all_zero_input_yield_zero_output()",
                 srtp_calc_aead_iv_srtcp_seq_num_over_0x7FFFFFFF_bad_param },
               { "srtp_calc_aead_iv_srtcp_distinct_iv_per_sequence_number()",
                 srtp_calc_aead_iv_srtcp_distinct_iv_per_sequence_number },
+              { "srtp_key_limit_rollback_restores_count_and_state()",
+                srtp_key_limit_rollback_restores_count_and_state },
 #ifdef MBEDTLS
               { "srtp_hmac_mbedtls_reinit_does_not_leak_key()",
                 srtp_hmac_mbedtls_reinit_does_not_leak_key },
@@ -279,3 +282,50 @@ void srtp_aes_gcm_mbedtls_reinit_does_not_leak_key(void)
     TEST_CHECK(srtp_shutdown() == srtp_err_status_ok);
 }
 #endif
+
+/*
+ * srtp_key_limit_rollback must exactly undo one srtp_key_limit_update():
+ * restore the remaining count and, when crossing back above the soft limit,
+ * return the state machine to normal - including reversing a hard-limit
+ * expiry so a rejected packet cannot burn key lifetime.
+ */
+void srtp_key_limit_rollback_restores_count_and_state(void)
+{
+    srtp_key_limit_ctx_t limit;
+
+    /* NULL is a no-op rather than a crash */
+    srtp_key_limit_rollback(NULL);
+
+    /* normal region: update then rollback restores both fields */
+    TEST_CHECK(srtp_key_limit_set(&limit, 0x100000) == srtp_err_status_ok);
+    srtp_xtd_seq_num_t before = limit.num_left;
+    TEST_CHECK(srtp_key_limit_update(&limit) == srtp_key_event_normal);
+    TEST_CHECK(limit.num_left == before - 1);
+    srtp_key_limit_rollback(&limit);
+    TEST_CHECK(limit.num_left == before);
+    TEST_CHECK(limit.state == srtp_key_state_normal);
+
+    /* soft limit: the update flips the state, rollback restores normal */
+    TEST_CHECK(srtp_key_limit_set(&limit, 0x10000) == srtp_err_status_ok);
+    TEST_CHECK(srtp_key_limit_update(&limit) == srtp_key_event_soft_limit);
+    TEST_CHECK(limit.state == srtp_key_state_past_soft_limit);
+    srtp_key_limit_rollback(&limit);
+    TEST_CHECK(limit.num_left == 0x10000);
+    TEST_CHECK(limit.state == srtp_key_state_normal);
+
+    /* hard limit: drive the smallest settable counter down to zero.  The final
+     * update expires the key; rollback must make it usable again. */
+    TEST_CHECK(srtp_key_limit_set(&limit, 0x10000) == srtp_err_status_ok);
+    while (limit.num_left > 1) {
+        (void)srtp_key_limit_update(&limit);
+    }
+    TEST_CHECK(limit.num_left == 1);
+    TEST_CHECK(srtp_key_limit_update(&limit) == srtp_key_event_hard_limit);
+    TEST_CHECK(limit.state == srtp_key_state_expired);
+    srtp_key_limit_rollback(&limit);
+    TEST_CHECK(limit.num_left == 1);
+    /* one remaining use sits in the past-soft-limit band, not expired */
+    TEST_CHECK(limit.state == srtp_key_state_past_soft_limit);
+    /* the next legitimate update is served and re-reports the hard limit */
+    TEST_CHECK(srtp_key_limit_update(&limit) == srtp_key_event_hard_limit);
+}

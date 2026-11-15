@@ -766,6 +766,69 @@ static void srtp_rdbx_restore_bits(srtp_rdbx_t *rdbx,
     }
 }
 
+/*
+ * Transactional snapshots of the receive replay state.  A packet is only
+ * allowed to mutate the replay databases, the stream direction or the key
+ * usage counters once every check (MKI lookup, replay, authentication,
+ * decryption) has succeeded; on any failure the snapshot is restored so that
+ * the rejected packet leaves no trace and the next legitimate packet is
+ * processed as if it had never arrived.
+ */
+typedef struct srtp_rdbx_snapshot_t {
+    srtp_xtd_seq_num_t index;
+    uint32_t bits[SRTP_RDBX_MAX_WORDS];
+    size_t window;
+} srtp_rdbx_snapshot_t;
+
+static void srtp_rdbx_save(const srtp_rdbx_t *rdbx,
+                           srtp_rdbx_snapshot_t *snapshot)
+{
+    snapshot->index = rdbx->index;
+    snapshot->window = bitvector_get_length(&rdbx->bitmask);
+    srtp_rdbx_save_bits(rdbx, snapshot->bits);
+}
+
+static void srtp_rdbx_rollback(srtp_rdbx_t *rdbx,
+                               const srtp_rdbx_snapshot_t *snapshot)
+{
+    rdbx->index = snapshot->index;
+    srtp_rdbx_restore_bits(rdbx, snapshot->bits, snapshot->window);
+}
+
+/*
+ * The SRTCP replay database (srtp_rdb_t) is a plain value type, so a whole
+ * struct copy captures and restores its complete state.
+ */
+static void srtp_rtcp_rdb_save(const srtp_rdb_t *rdb, srtp_rdb_t *snapshot)
+{
+    *snapshot = *rdb;
+}
+
+static void srtp_rtcp_rdb_rollback(srtp_rdb_t *rdb, const srtp_rdb_t *snapshot)
+{
+    *rdb = *snapshot;
+}
+
+/*
+ * Remove any plaintext that a failed receive may already have written into
+ * the caller's output buffer.  AEAD ciphers emit plaintext before the
+ * authentication tag is verified, so a tag failure otherwise leaves partial
+ * plaintext behind.
+ *
+ * In in-place IO the output region is the caller's input packet itself, so it
+ * must never be overwritten: the caller retains and discards that buffer on
+ * error.  Only a distinct output buffer is scrubbed.
+ */
+static void srtp_scrub_output(const uint8_t *in,
+                              uint8_t *out,
+                              size_t enc_start,
+                              size_t enc_octet_len)
+{
+    if (out != NULL && out != in && enc_octet_len != 0) {
+        memset(out + enc_start, 0, enc_octet_len);
+    }
+}
+
 static srtp_err_status_t srtp_stream_clone(
     const srtp_stream_ctx_t *stream_template,
     uint32_t ssrc,
@@ -2382,8 +2445,8 @@ static srtp_err_status_t srtp_unprotect_aead(srtp_ctx_t *ctx,
                                              bool advance_packet_index)
 {
     const srtp_hdr_t *hdr = (const srtp_hdr_t *)srtp;
-    size_t enc_start;         /* offset to start of encrypted portion  */
-    size_t enc_octet_len = 0; /* number of octets in encrypted portion */
+    size_t enc_start = 0;       /* offset to start of encrypted portion  */
+    size_t enc_octet_len = 0;   /* number of octets in encrypted portion */
     v128_t iv;
     srtp_err_status_t status;
     size_t tag_len;
@@ -2391,7 +2454,25 @@ static srtp_err_status_t srtp_unprotect_aead(srtp_ctx_t *ctx,
     size_t rcc_extra = 0;        /* octets of ROC carried (RFC 4771 mode 3) */
     uint32_t rcc_roc_sender = 0; /* ROC read from a ROC-carrying packet     */
 
+    /*
+     * Snapshot every piece of stream state that this packet may touch.  The
+     * fail label restores it verbatim, so a rejected packet cannot advance
+     * the replay window, flip the direction or consume key lifetime.
+     */
+    srtp_rdbx_snapshot_t rdbx_snapshot;
+    direction_t direction_saved = stream->direction;
+    srtp_key_limit_ctx_t *key_limit = session_keys->limit;
+    /*
+     * GCM emits plaintext into the output buffer before its tag is verified.
+     * This flag records that such a write happened so the fail label can scrub
+     * only the bytes actually produced; every other failure occurs before any
+     * output write and must leave the caller's buffer untouched.
+     */
+    bool plaintext_written = false;
+
     debug_print0(mod_srtp, "function srtp_unprotect_aead");
+
+    srtp_rdbx_save(&stream->rtp_rdbx, &rdbx_snapshot);
 
     debug_print(mod_srtp, "estimated u_packet index: %016" PRIx64, est);
 
@@ -2415,7 +2496,8 @@ static srtp_err_status_t srtp_unprotect_aead(srtp_ctx_t *ctx,
             rcc_extra = 4;
             if (srtp_len <
                 octets_in_rtp_header + stream->mki_size + tag_len + rcc_extra) {
-                return srtp_err_status_bad_param;
+                status = srtp_err_status_bad_param;
+                goto fail;
             }
             /* the ROC is the last field, after the optional MKI */
             memcpy(&rcc_roc_sender, srtp + srtp_len - rcc_extra, 4);
@@ -2429,7 +2511,7 @@ static srtp_err_status_t srtp_unprotect_aead(srtp_ctx_t *ctx,
             status = srtp_estimate_index(&stream->rtp_rdbx, rcc_roc_sender,
                                          &est, seq, &delta);
             if (status && (status != srtp_err_status_pkt_idx_adv)) {
-                return status;
+                goto fail;
             }
             if (status == srtp_err_status_pkt_idx_adv) {
                 advance_packet_index = true;
@@ -2437,13 +2519,13 @@ static srtp_err_status_t srtp_unprotect_aead(srtp_ctx_t *ctx,
                 advance_packet_index = false;
                 status = srtp_rdbx_check(&stream->rtp_rdbx, delta);
                 if (status) {
-                    return status;
+                    goto fail;
                 }
             }
         } else {
             status = srtp_get_est_pkt_index(hdr, stream, &est, &delta);
             if (status && (status != srtp_err_status_pkt_idx_adv)) {
-                return status;
+                goto fail;
             }
             if (status == srtp_err_status_pkt_idx_adv) {
                 advance_packet_index = true;
@@ -2451,7 +2533,7 @@ static srtp_err_status_t srtp_unprotect_aead(srtp_ctx_t *ctx,
                 advance_packet_index = false;
                 status = srtp_rdbx_check(&stream->rtp_rdbx, delta);
                 if (status) {
-                    return status;
+                    goto fail;
                 }
             }
         }
@@ -2471,7 +2553,8 @@ static srtp_err_status_t srtp_unprotect_aead(srtp_ctx_t *ctx,
                                     (uint8_t *)&iv, srtp_direction_encrypt);
     }
     if (status) {
-        return srtp_err_status_cipher_fail;
+        status = srtp_err_status_cipher_fail;
+        goto fail;
     }
 
     enc_start = srtp_get_rtp_hdr_len(hdr);
@@ -2483,18 +2566,20 @@ static srtp_err_status_t srtp_unprotect_aead(srtp_ctx_t *ctx,
     status = srtp_cryptex_unprotect_init(stream, hdr, srtp, rtp, &cryptex_inuse,
                                          &cryptex_inplace, &enc_start);
     if (status) {
-        return status;
+        goto fail;
     }
 
     if (cryptex_inuse && !cryptex_inplace && hdr->cc) {
         debug_print0(mod_srtp,
                      "unsupported cryptex mode, AEAD, CC and not inplace io");
-        return srtp_err_status_cryptex_err;
+        status = srtp_err_status_cryptex_err;
+        goto fail;
     }
 
     if (tag_len + stream->mki_size > srtp_len ||
         enc_start > srtp_len - tag_len - stream->mki_size - rcc_extra) {
-        return srtp_err_status_parse_err;
+        status = srtp_err_status_parse_err;
+        goto fail;
     }
 
     /*
@@ -2510,12 +2595,14 @@ static srtp_err_status_t srtp_unprotect_aead(srtp_ctx_t *ctx,
      * as the tag length.
      */
     if (enc_octet_len < tag_len) {
-        return srtp_err_status_cipher_fail;
+        status = srtp_err_status_cipher_fail;
+        goto fail;
     }
 
     /* check output length */
     if (*rtp_len < srtp_len - stream->mki_size - tag_len - rcc_extra) {
-        return srtp_err_status_buffer_small;
+        status = srtp_err_status_buffer_small;
+        goto fail;
     }
 
     /* if not-inplace then need to copy full rtp header */
@@ -2536,7 +2623,8 @@ static srtp_err_status_t srtp_unprotect_aead(srtp_ctx_t *ctx,
         break;
     case srtp_key_event_hard_limit:
         srtp_handle_event(ctx, stream, event_key_hard_limit);
-        return srtp_err_status_key_expired;
+        status = srtp_err_status_key_expired;
+        goto fail;
     default:
         break;
     }
@@ -2545,7 +2633,7 @@ static srtp_err_status_t srtp_unprotect_aead(srtp_ctx_t *ctx,
         status = srtp_cryptex_unprotect(cryptex_inplace, hdr, rtp,
                                         session_keys->rtp_cipher);
         if (status) {
-            return status;
+            goto fail;
         }
     }
 
@@ -2555,17 +2643,21 @@ static srtp_err_status_t srtp_unprotect_aead(srtp_ctx_t *ctx,
     aad_len = enc_start;
     status = srtp_cipher_set_aad(session_keys->rtp_cipher, srtp, aad_len);
     if (status) {
-        return srtp_err_status_cipher_fail;
+        status = srtp_err_status_cipher_fail;
+        goto fail;
     }
 
     /* Decrypt the ciphertext.  This also checks the auth tag based
-     * on the AAD we just specified above */
+     * on the AAD we just specified above.  GCM emits plaintext before
+     * verifying the tag, so record the write and scrub that output on a
+     * tag failure via the fail label. */
     size_t outlen = *rtp_len - enc_start;
     status = srtp_cipher_decrypt(session_keys->rtp_cipher, srtp + enc_start,
                                  enc_octet_len, rtp + enc_start, &outlen);
     enc_octet_len = outlen;
+    plaintext_written = true;
     if (status) {
-        return status;
+        goto fail;
     }
 
     if (hdr->x == 1 && session_keys->rtp_xtn_hdr_cipher) {
@@ -2575,7 +2667,7 @@ static srtp_err_status_t srtp_unprotect_aead(srtp_ctx_t *ctx,
         status = srtp_process_header_encryption(
             stream, srtp_get_rtp_xtn_hdr(hdr, rtp), session_keys);
         if (status) {
-            return status;
+            goto fail;
         }
     }
 
@@ -2610,14 +2702,14 @@ static srtp_err_status_t srtp_unprotect_aead(srtp_ctx_t *ctx,
         status =
             srtp_stream_clone(ctx->stream_template, hdr->ssrc, &new_stream);
         if (status) {
-            return status;
+            goto fail;
         }
 
         /* add new stream to the list */
         status = srtp_insert_or_dealloc_stream(ctx->stream_list, new_stream,
                                                ctx->stream_template);
         if (status) {
-            return status;
+            goto fail;
         }
 
         /* set stream (the pointer used in this function) */
@@ -2642,6 +2734,18 @@ static srtp_err_status_t srtp_unprotect_aead(srtp_ctx_t *ctx,
     *rtp_len = enc_start + enc_octet_len;
 
     return srtp_err_status_ok;
+
+fail:
+    /* roll back every observation this rejected packet may have made */
+    srtp_rdbx_rollback(&stream->rtp_rdbx, &rdbx_snapshot);
+    stream->direction = direction_saved;
+    srtp_key_limit_rollback(key_limit);
+    if (plaintext_written) {
+        /* only GCM decryption can have written plaintext before its tag was
+         * verified; scrub just those bytes and leave all other buffers alone */
+        srtp_scrub_output(srtp, rtp, enc_start, enc_octet_len);
+    }
+    return status;
 }
 
 srtp_err_status_t srtp_protect(srtp_t ctx,
@@ -3012,7 +3116,7 @@ srtp_err_status_t srtp_unprotect(srtp_t ctx,
                                  size_t *rtp_len)
 {
     const srtp_hdr_t *hdr = (const srtp_hdr_t *)srtp;
-    size_t enc_start;               /* pointer to start of encrypted portion  */
+    size_t enc_start = 0;           /* pointer to start of encrypted portion  */
     const uint8_t *auth_start;      /* pointer to start of auth. portion      */
     size_t enc_octet_len = 0;       /* number of octets in encrypted portion  */
     const uint8_t *auth_tag = NULL; /* location of auth_tag within packet     */
@@ -3031,6 +3135,16 @@ srtp_err_status_t srtp_unprotect(srtp_t ctx,
     bool rcc_carry;             /* packet carries the ROC (RFC 4771)      */
     size_t rcc_tag_len;         /* number of tag octets actually present  */
     uint32_t roc_sender = 0;    /* ROC read from a ROC-carrying packet    */
+
+    /*
+     * Transaction state.  Everything below the snapshot point may mutate the
+     * stream; the fail label restores all of it so that a rejected packet
+     * (bad MKI, replay, failed authentication, ...) leaves no observable
+     * trace behind.
+     */
+    srtp_rdbx_snapshot_t rdbx_snapshot;
+    direction_t direction_saved;
+    srtp_key_limit_ctx_t *key_limit;
 
     debug_print0(mod_srtp, "function srtp_unprotect");
 
@@ -3098,6 +3212,20 @@ srtp_err_status_t srtp_unprotect(srtp_t ctx,
         return srtp_err_status_direction_mismatch;
     }
 
+    /*
+     * Resolve the session keys from the MKI before any replay state is
+     * consulted.  An unknown MKI (or a packet too short to carry one) fails
+     * immediately with bad_mki: there is no fallback to a default key, and
+     * nothing about the stream has been touched at this point.  How many
+     * octets trail the MKI depends on the RCC mode and on whether this packet
+     * carries the ROC, so the lookup is told which it is.
+     */
+    status = srtp_get_session_keys_for_rtp_packet(stream, srtp, srtp_len,
+                                                  rcc_carry, &session_keys);
+    if (status) {
+        return status;
+    }
+
     if (from_template || rcc_carry || stream->rcc_mode == srtp_rcc_mode_3) {
         /*
          * set estimated packet index to sequence number from header,
@@ -3130,25 +3258,25 @@ srtp_err_status_t srtp_unprotect(srtp_t ctx,
     debug_print(mod_srtp, "estimated u_packet index: %016" PRIx64, est);
 
     /*
-     * Determine if MKI is being used and what session keys should be used.
-     * How many octets trail the MKI depends on the RCC mode and on whether
-     * this packet carries the ROC, so the lookup is told which it is.
-     */
-    status = srtp_get_session_keys_for_rtp_packet(stream, srtp, srtp_len,
-                                                  rcc_carry, &session_keys);
-    if (status) {
-        return status;
-    }
-
-    /*
      * Check if this is an AEAD stream (GCM mode).  If so, then dispatch
-     * the request to our AEAD handler.
+     * the request to our AEAD handler, which runs its own snapshot/rollback
+     * transaction.  Only read-only index estimation has happened so far, so
+     * there is no state here to undo.
      */
     if (session_keys->rtp_cipher->algorithm == SRTP_AES_GCM_128 ||
         session_keys->rtp_cipher->algorithm == SRTP_AES_GCM_256) {
         return srtp_unprotect_aead(ctx, stream, delta, est, srtp, srtp_len, rtp,
                                    rtp_len, session_keys, advance_packet_index);
     }
+
+    /*
+     * From here on processing can mutate this stream, so snapshot its replay
+     * database, direction and key-limit context.  Every failure below routes
+     * through the fail label, which restores this exact state.
+     */
+    srtp_rdbx_save(&stream->rtp_rdbx, &rdbx_snapshot);
+    direction_saved = stream->direction;
+    key_limit = session_keys->limit;
 
     /* get tag length from stream */
     tag_len = srtp_auth_get_tag_length(session_keys->rtp_auth);
@@ -3165,7 +3293,8 @@ srtp_err_status_t srtp_unprotect(srtp_t ctx,
 
     if (rcc_carry) {
         if (srtp_len < octets_in_rtp_header + stream->mki_size + tag_len) {
-            return srtp_err_status_bad_param;
+            status = srtp_err_status_bad_param;
+            goto fail;
         }
         memcpy(&roc_sender, srtp + srtp_len - tag_len, 4);
         roc_sender = ntohl(roc_sender);
@@ -3179,7 +3308,7 @@ srtp_err_status_t srtp_unprotect(srtp_t ctx,
         status = srtp_estimate_index(&stream->rtp_rdbx, roc_sender, &est,
                                      ntohs(hdr->seq), &delta);
         if (status && (status != srtp_err_status_pkt_idx_adv)) {
-            return status;
+            goto fail;
         }
         if (status == srtp_err_status_pkt_idx_adv) {
             advance_packet_index = true;
@@ -3189,7 +3318,7 @@ srtp_err_status_t srtp_unprotect(srtp_t ctx,
             advance_packet_index = false;
             status = srtp_rdbx_check(&stream->rtp_rdbx, delta);
             if (status) {
-                return status;
+                goto fail;
             }
         }
         debug_print(mod_srtp, "carried u_packet index: %016" PRIx64, est);
@@ -3224,7 +3353,8 @@ srtp_err_status_t srtp_unprotect(srtp_t ctx,
         }
     }
     if (status) {
-        return srtp_err_status_cipher_fail;
+        status = srtp_err_status_cipher_fail;
+        goto fail;
     }
 
     /* shift est, put into network byte order */
@@ -3239,18 +3369,20 @@ srtp_err_status_t srtp_unprotect(srtp_t ctx,
     status = srtp_cryptex_unprotect_init(stream, hdr, srtp, rtp, &cryptex_inuse,
                                          &cryptex_inplace, &enc_start);
     if (status) {
-        return status;
+        goto fail;
     }
 
     if (rcc_tag_len + stream->mki_size > srtp_len ||
         enc_start > srtp_len - rcc_tag_len - stream->mki_size) {
-        return srtp_err_status_parse_err;
+        status = srtp_err_status_parse_err;
+        goto fail;
     }
     enc_octet_len = srtp_len - enc_start - stream->mki_size - rcc_tag_len;
 
     /* check output length */
     if (*rtp_len < srtp_len - stream->mki_size - rcc_tag_len) {
-        return srtp_err_status_buffer_small;
+        status = srtp_err_status_buffer_small;
+        goto fail;
     }
 
     /* if not-inplace then need to copy full rtp header */
@@ -3290,21 +3422,22 @@ srtp_err_status_t srtp_unprotect(srtp_t ctx,
             debug_print(mod_srtp, "keystream prefix: %s",
                         srtp_octet_string_hex_string(tmp_tag, prefix_len));
             if (status) {
-                return srtp_err_status_cipher_fail;
+                status = srtp_err_status_cipher_fail;
+                goto fail;
             }
         }
 
         /* initialize auth func context */
         status = srtp_auth_start(session_keys->rtp_auth);
         if (status) {
-            return status;
+            goto fail;
         }
 
         /* now compute auth function over packet */
         status = srtp_auth_update(session_keys->rtp_auth, auth_start,
                                   srtp_len - tag_len - stream->mki_size);
         if (status) {
-            return status;
+            goto fail;
         }
 
         /* run auth func over ROC, then write tmp tag */
@@ -3316,17 +3449,20 @@ srtp_err_status_t srtp_unprotect(srtp_t ctx,
         debug_print(mod_srtp, "packet auth tag:      %s",
                     srtp_octet_string_hex_string(auth_tag, tag_len));
         if (status) {
-            return srtp_err_status_auth_fail;
+            status = srtp_err_status_auth_fail;
+            goto fail;
         }
 
         if (rcc_carry) {
             /* RFC 4771: MAC_tr occupies the (tag_len - 4) octets after the
              * ROC */
             if (!srtp_octet_string_equal(tmp_tag, auth_tag + 4, tag_len - 4)) {
-                return srtp_err_status_auth_fail;
+                status = srtp_err_status_auth_fail;
+                goto fail;
             }
         } else if (!srtp_octet_string_equal(tmp_tag, auth_tag, tag_len)) {
-            return srtp_err_status_auth_fail;
+            status = srtp_err_status_auth_fail;
+            goto fail;
         }
     }
 
@@ -3343,7 +3479,8 @@ srtp_err_status_t srtp_unprotect(srtp_t ctx,
         break;
     case srtp_key_event_hard_limit:
         srtp_handle_event(ctx, stream, event_key_hard_limit);
-        return srtp_err_status_key_expired;
+        status = srtp_err_status_key_expired;
+        goto fail;
     default:
         break;
     }
@@ -3353,7 +3490,7 @@ srtp_err_status_t srtp_unprotect(srtp_t ctx,
         status = srtp_process_header_encryption(
             stream, srtp_get_rtp_xtn_hdr(hdr, rtp), session_keys);
         if (status) {
-            return status;
+            goto fail;
         }
     }
 
@@ -3361,7 +3498,7 @@ srtp_err_status_t srtp_unprotect(srtp_t ctx,
         status = srtp_cryptex_unprotect(cryptex_inplace, hdr, rtp,
                                         session_keys->rtp_cipher);
         if (status) {
-            return status;
+            goto fail;
         }
     }
 
@@ -3371,7 +3508,8 @@ srtp_err_status_t srtp_unprotect(srtp_t ctx,
             srtp_cipher_decrypt(session_keys->rtp_cipher, srtp + enc_start,
                                 enc_octet_len, rtp + enc_start, &enc_octet_len);
         if (status) {
-            return srtp_err_status_cipher_fail;
+            status = srtp_err_status_cipher_fail;
+            goto fail;
         }
     } else if (rtp != srtp) {
         /* if no encryption and not-inplace then need to copy rest of packet */
@@ -3409,14 +3547,14 @@ srtp_err_status_t srtp_unprotect(srtp_t ctx,
         status =
             srtp_stream_clone(ctx->stream_template, hdr->ssrc, &new_stream);
         if (status) {
-            return status;
+            goto fail;
         }
 
         /* add new stream to the list */
         status = srtp_insert_or_dealloc_stream(ctx->stream_list, new_stream,
                                                ctx->stream_template);
         if (status) {
-            return status;
+            goto fail;
         }
 
         /* set stream (the pointer used in this function) */
@@ -3439,7 +3577,21 @@ srtp_err_status_t srtp_unprotect(srtp_t ctx,
     *rtp_len = enc_start + enc_octet_len;
 
     return srtp_err_status_ok;
+
+fail:
+    /*
+     * The packet failed, so undo every observation it may have made.  The
+     * stream stays usable for the next legitimate packet.  No plaintext needs
+     * scrubbing here: in the non-AEAD path decryption and payload copies only
+     * run after authentication succeeds, so every failure above happens before
+     * any output byte is written and the output buffer is left untouched.
+     */
+    srtp_rdbx_rollback(&stream->rtp_rdbx, &rdbx_snapshot);
+    stream->direction = direction_saved;
+    srtp_key_limit_rollback(key_limit);
+    return status;
 }
+
 
 srtp_err_status_t srtp_init(void)
 {
@@ -4205,10 +4357,11 @@ static srtp_err_status_t srtp_unprotect_rtcp_aead(
     srtp_session_keys_t *session_keys)
 {
     const srtcp_hdr_t *hdr = (const srtcp_hdr_t *)srtcp;
-    size_t enc_start;               /* pointer to start of encrypted portion  */
+    size_t enc_start = octets_in_rtcp_header;
     const uint8_t *trailer_p;       /* pointer to start of trailer            */
     uint32_t trailer;               /* trailer value                          */
     size_t enc_octet_len = 0;       /* number of octets in encrypted portion  */
+    size_t plain_octet_len = 0;     /* octets written to rtcp after decrypt   */
     const uint8_t *auth_tag = NULL; /* location of auth_tag within packet     */
     srtp_err_status_t status;
     size_t tag_len;
@@ -4216,10 +4369,20 @@ static srtp_err_status_t srtp_unprotect_rtcp_aead(
     uint32_t seq_num;
     v128_t iv;
 
+    /*
+     * Snapshot the SRTCP replay database and direction.  GCM writes plaintext
+     * before its tag is verified, so a failed packet must roll the state back
+     * and have any emitted plaintext scrubbed.
+     */
+    srtp_rdb_t rdb_snapshot;
+    direction_t direction_saved = stream->direction;
+    /* set only once decryption has actually emitted plaintext into rtcp */
+    bool plaintext_written = false;
+
+    srtp_rtcp_rdb_save(&stream->rtcp_rdb, &rdb_snapshot);
+
     /* get tag length from stream context */
     tag_len = srtp_auth_get_tag_length(session_keys->rtcp_auth);
-
-    enc_start = octets_in_rtcp_header;
 
     /*
      * set encryption start, encryption length, and trailer
@@ -4248,7 +4411,7 @@ static srtp_err_status_t srtp_unprotect_rtcp_aead(
     debug_print(mod_srtp, "srtcp index: %x", (unsigned int)seq_num);
     status = srtp_rdb_check(&stream->rtcp_rdb, seq_num);
     if (status) {
-        return status;
+        goto fail;
     }
 
     /*
@@ -4256,18 +4419,21 @@ static srtp_err_status_t srtp_unprotect_rtcp_aead(
      */
     status = srtp_calc_aead_iv_srtcp(session_keys, &iv, seq_num, hdr);
     if (status) {
-        return srtp_err_status_cipher_fail;
+        status = srtp_err_status_cipher_fail;
+        goto fail;
     }
     status = srtp_cipher_set_iv(session_keys->rtcp_cipher, (uint8_t *)&iv,
                                 srtp_direction_decrypt);
     if (status) {
-        return srtp_err_status_cipher_fail;
+        status = srtp_err_status_cipher_fail;
+        goto fail;
     }
 
     /* check output length */
     if (*rtcp_len <
         srtcp_len - sizeof(srtcp_trailer_t) - stream->mki_size - tag_len) {
-        return srtp_err_status_buffer_small;
+        status = srtp_err_status_buffer_small;
+        goto fail;
     }
 
     /* if not inplace need to copy rtcp header */
@@ -4286,7 +4452,8 @@ static srtp_err_status_t srtp_unprotect_rtcp_aead(
         status = srtp_cipher_set_aad(session_keys->rtcp_cipher, srtcp,
                                      octets_in_rtcp_header);
         if (status) {
-            return srtp_err_status_cipher_fail;
+            status = srtp_err_status_cipher_fail;
+            goto fail;
         }
     } else {
         /*
@@ -4298,7 +4465,8 @@ static srtp_err_status_t srtp_unprotect_rtcp_aead(
             session_keys->rtcp_cipher, srtcp,
             (srtcp_len - tag_len - sizeof(srtcp_trailer_t) - stream->mki_size));
         if (status) {
-            return (srtp_err_status_cipher_fail);
+            status = srtp_err_status_cipher_fail;
+            goto fail;
         }
     }
 
@@ -4308,7 +4476,8 @@ static srtp_err_status_t srtp_unprotect_rtcp_aead(
     status = srtp_cipher_set_aad(session_keys->rtcp_cipher, (uint8_t *)&trailer,
                                  sizeof(trailer));
     if (status) {
-        return (srtp_err_status_cipher_fail);
+        status = srtp_err_status_cipher_fail;
+        goto fail;
     }
 
     /* if we're decrypting, exor keystream into the message */
@@ -4317,18 +4486,23 @@ static srtp_err_status_t srtp_unprotect_rtcp_aead(
         status =
             srtp_cipher_decrypt(session_keys->rtcp_cipher, srtcp + enc_start,
                                 enc_octet_len, rtcp + enc_start, &out_len);
+        /* GCM emits plaintext before its tag check, so the output buffer now
+         * holds up to out_len plaintext bytes regardless of the result. */
+        plaintext_written = true;
+        plain_octet_len = out_len;
         if (status) {
-            return status;
+            goto fail;
         }
     } else {
         /*
-         * Still need to run the cipher to check the tag
+         * Still need to run the cipher to check the tag.  Output is NULL, so
+         * no plaintext is produced here.
          */
         tmp_len = 0;
         status = srtp_cipher_decrypt(session_keys->rtcp_cipher, auth_tag,
                                      tag_len, NULL, &tmp_len);
         if (status) {
-            return status;
+            goto fail;
         }
 
         /* if no encryption and not-inplace then copy the authenticated data */
@@ -4336,6 +4510,8 @@ static srtp_err_status_t srtp_unprotect_rtcp_aead(
             memcpy(rtcp + enc_start, srtcp + enc_start,
                    enc_octet_len - tag_len);
         }
+        plain_octet_len = enc_octet_len - tag_len;
+        plaintext_written = (rtcp != srtcp);
     }
 
     *rtcp_len = srtcp_len;
@@ -4370,14 +4546,14 @@ static srtp_err_status_t srtp_unprotect_rtcp_aead(
         status =
             srtp_stream_clone(ctx->stream_template, hdr->ssrc, &new_stream);
         if (status) {
-            return status;
+            goto fail;
         }
 
         /* add new stream to the list */
         status = srtp_insert_or_dealloc_stream(ctx->stream_list, new_stream,
                                                ctx->stream_template);
         if (status) {
-            return status;
+            goto fail;
         }
 
         /* set stream (the pointer used in this function) */
@@ -4388,6 +4564,16 @@ static srtp_err_status_t srtp_unprotect_rtcp_aead(
     srtp_rdb_add_index(&stream->rtcp_rdb, seq_num);
 
     return srtp_err_status_ok;
+
+fail:
+    srtp_rtcp_rdb_rollback(&stream->rtcp_rdb, &rdb_snapshot);
+    stream->direction = direction_saved;
+    if (plaintext_written) {
+        /* only scrub bytes that decryption actually produced; failures before
+         * that point leave the caller's output buffer untouched */
+        srtp_scrub_output(srtcp, rtcp, enc_start, plain_octet_len);
+    }
+    return status;
 }
 
 srtp_err_status_t srtp_protect_rtcp(srtp_t ctx,
@@ -4662,6 +4848,14 @@ srtp_err_status_t srtp_unprotect_rtcp(srtp_t ctx,
     srtp_session_keys_t *session_keys = NULL;
 
     /*
+     * Transaction state for the non-AEAD path below.  GCM is dispatched to
+     * srtp_unprotect_rtcp_aead(), which maintains its own transaction; only
+     * read-only checks happen before that dispatch.
+     */
+    srtp_rdb_t rdb_snapshot;
+    direction_t direction_saved;
+
+    /*
      * check that the length value is sane; we'll check again once we
      * know the tag length, but we at least want to know that it is
      * a positive value
@@ -4707,7 +4901,9 @@ srtp_err_status_t srtp_unprotect_rtcp(srtp_t ctx,
     }
 
     /*
-     * Determine if MKI is being used and what session keys should be used
+     * Determine if MKI is being used and what session keys should be used.
+     * An unknown MKI fails here with bad_mki before any replay or stream
+     * state is consulted; there is no default-key fallback.
      */
     status = srtp_get_session_keys_for_rtcp_packet(stream, srtcp, srtcp_len,
                                                    &session_keys);
@@ -4728,13 +4924,22 @@ srtp_err_status_t srtp_unprotect_rtcp(srtp_t ctx,
 
     /*
      * Check if this is an AEAD stream (GCM mode).  If so, then dispatch
-     * the request to our AEAD handler.
+     * the request to our AEAD handler, which runs its own snapshot/rollback
+     * transaction.
      */
     if (session_keys->rtp_cipher->algorithm == SRTP_AES_GCM_128 ||
         session_keys->rtp_cipher->algorithm == SRTP_AES_GCM_256) {
         return srtp_unprotect_rtcp_aead(ctx, stream, srtcp, srtcp_len, rtcp,
                                         rtcp_len, session_keys);
     }
+
+    /*
+     * Everything below can mutate this stream, so snapshot the replay
+     * database and the direction.  Every failure routes through fail and
+     * restores this exact state.
+     */
+    srtp_rtcp_rdb_save(&stream->rtcp_rdb, &rdb_snapshot);
+    direction_saved = stream->direction;
 
     sec_serv_confidentiality = stream->rtcp_services == sec_serv_conf ||
                                stream->rtcp_services == sec_serv_conf_and_auth;
@@ -4757,7 +4962,8 @@ srtp_err_status_t srtp_unprotect_rtcp(srtp_t ctx,
 
     e_bit_in_packet = (*trailer_p & SRTCP_E_BYTE_BIT) == SRTCP_E_BYTE_BIT;
     if (e_bit_in_packet != sec_serv_confidentiality) {
-        return srtp_err_status_cant_check;
+        status = srtp_err_status_cant_check;
+        goto fail;
     }
 
     /*
@@ -4782,7 +4988,7 @@ srtp_err_status_t srtp_unprotect_rtcp(srtp_t ctx,
     debug_print(mod_srtp, "srtcp index: %x", (unsigned int)seq_num);
     status = srtp_rdb_check(&stream->rtcp_rdb, seq_num);
     if (status) {
-        return status;
+        goto fail;
     }
 
     /*
@@ -4812,7 +5018,8 @@ srtp_err_status_t srtp_unprotect_rtcp(srtp_t ctx,
                                     srtp_direction_decrypt);
     }
     if (status) {
-        return srtp_err_status_cipher_fail;
+        status = srtp_err_status_cipher_fail;
+        goto fail;
     }
 
     /*
@@ -4826,14 +5033,15 @@ srtp_err_status_t srtp_unprotect_rtcp(srtp_t ctx,
         debug_print(mod_srtp, "keystream prefix: %s",
                     srtp_octet_string_hex_string(tmp_tag, prefix_len));
         if (status) {
-            return srtp_err_status_cipher_fail;
+            status = srtp_err_status_cipher_fail;
+            goto fail;
         }
     }
 
     /* initialize auth func context */
     status = srtp_auth_start(session_keys->rtcp_auth);
     if (status) {
-        return status;
+        goto fail;
     }
 
     /* run auth func over packet, put result into tmp_tag */
@@ -4842,20 +5050,23 @@ srtp_err_status_t srtp_unprotect_rtcp(srtp_t ctx,
     debug_print(mod_srtp, "srtcp computed tag:       %s",
                 srtp_octet_string_hex_string(tmp_tag, tag_len));
     if (status) {
-        return srtp_err_status_auth_fail;
+        status = srtp_err_status_auth_fail;
+        goto fail;
     }
 
     /* compare the tag just computed with the one in the packet */
     debug_print(mod_srtp, "srtcp tag from packet:    %s",
                 srtp_octet_string_hex_string(auth_tag, tag_len));
     if (!srtp_octet_string_equal(tmp_tag, auth_tag, tag_len)) {
-        return srtp_err_status_auth_fail;
+        status = srtp_err_status_auth_fail;
+        goto fail;
     }
 
     /* check output length */
     if (*rtcp_len <
         srtcp_len - sizeof(srtcp_trailer_t) - stream->mki_size - tag_len) {
-        return srtp_err_status_buffer_small;
+        status = srtp_err_status_buffer_small;
+        goto fail;
     }
 
     /* if not inplace need to copy rtcp header */
@@ -4869,7 +5080,8 @@ srtp_err_status_t srtp_unprotect_rtcp(srtp_t ctx,
                                      srtcp + enc_start, enc_octet_len,
                                      rtcp + enc_start, &enc_octet_len);
         if (status) {
-            return srtp_err_status_cipher_fail;
+            status = srtp_err_status_cipher_fail;
+            goto fail;
         }
     } else if (srtcp != rtcp) {
         /* if no encryption and not-inplace then need to copy rest of packet */
@@ -4911,14 +5123,14 @@ srtp_err_status_t srtp_unprotect_rtcp(srtp_t ctx,
         status =
             srtp_stream_clone(ctx->stream_template, hdr->ssrc, &new_stream);
         if (status) {
-            return status;
+            goto fail;
         }
 
         /* add new stream to the list */
         status = srtp_insert_or_dealloc_stream(ctx->stream_list, new_stream,
                                                ctx->stream_template);
         if (status) {
-            return status;
+            goto fail;
         }
 
         /* set stream (the pointer used in this function) */
@@ -4929,6 +5141,15 @@ srtp_err_status_t srtp_unprotect_rtcp(srtp_t ctx,
     srtp_rdb_add_index(&stream->rtcp_rdb, seq_num);
 
     return srtp_err_status_ok;
+
+fail:
+    /* reject the packet completely: restore replay/direction state.  No
+     * plaintext needs scrubbing: every output write in this non-AEAD path
+     * happens only after the authentication tag has been verified, so a
+     * failure always occurs before any output byte is written. */
+    srtp_rtcp_rdb_rollback(&stream->rtcp_rdb, &rdb_snapshot);
+    stream->direction = direction_saved;
+    return status;
 }
 
 /*
