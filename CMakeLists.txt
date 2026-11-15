@@ -490,6 +490,17 @@ if(LIBSRTP_TEST_APPS)
     target_link_libraries(test_srtp_policy srtp3)
     add_test(test_srtp_policy test_srtp_policy)
 
+    add_executable(test_srtcp test/test_srtcp.c test/util.c)
+    target_set_warnings(
+            TARGET
+            test_srtcp
+            ENABLE
+            ${ENABLE_WARNINGS}
+            AS_ERRORS
+            ${ENABLE_WARNINGS_AS_ERRORS})
+    target_link_libraries(test_srtcp srtp3)
+    add_test(test_srtcp test_srtcp)
+
     add_executable(rcc_test test/rcc_test.c test/util.c)
     target_set_warnings(
             TARGET
