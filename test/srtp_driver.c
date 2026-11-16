@@ -155,6 +155,8 @@ srtp_err_status_t srtp_test_cryptex_not_in_place_distinct_buffer(void);
 
 srtp_err_status_t srtp_test_missing_session_keys(void);
 
+srtp_err_status_t srtp_test_key_rotation_receive(void);
+
 double srtp_bits_per_second(size_t msg_len_octets,
                             const test_policy_t *test_policy);
 
@@ -1028,6 +1030,14 @@ int main(int argc, char *argv[])
 
         printf("testing missing session keys handling()...");
         if (srtp_test_missing_session_keys() == srtp_err_status_ok) {
+            printf("passed\n");
+        } else {
+            printf("failed\n");
+            exit(1);
+        }
+
+        printf("testing atomic receive across key rotation()...");
+        if (srtp_test_key_rotation_receive() == srtp_err_status_ok) {
             printf("passed\n");
         } else {
             printf("failed\n");
@@ -5664,6 +5674,481 @@ srtp_err_status_t srtp_test_update_mki(void)
     }
 
     srtp_policy_destroy(policy);
+
+    return srtp_err_status_ok;
+}
+
+/*
+ * srtp_test_key_rotation_receive() pins down the atomic receive semantics
+ * around key rotation:
+ *
+ *   - a packet whose MKI is not configured must be rejected with bad_mki and
+ *     must not fall back to another (for instance the first) key set,
+ *   - a rejected packet must not advance the replay state of its stream,
+ *   - a rejected packet must not leave partial plaintext in the output,
+ *   - parallel SSRCs keep independent matching and replay state, so identical
+ *     sequence numbers arriving under different keys are accepted, and
+ *   - the next legitimate packet is still processed normally.
+ *
+ * The same checks run for AES-CM and AES-GCM, in-place and out-of-place.
+ */
+#define ROT_PACKET_BUF_LEN 512
+#define ROT_PAYLOAD_FIRST 0xa0
+#define ROT_PAYLOAD_LEN 24
+
+/* RTP packet: 12-octet header followed by a recognisable payload. */
+static size_t srtp_test_make_rtp(uint8_t *buf, uint16_t seq, uint32_t ssrc)
+{
+    uint16_t net_seq = htons(seq);
+    uint32_t net_ssrc = htonl(ssrc);
+    uint32_t ts = 0;
+
+    memset(buf, 0, ROT_PACKET_BUF_LEN);
+    buf[0] = 0x80; /* V=2 */
+    buf[1] = 0x00;
+    memcpy(buf + 2, &net_seq, 2);
+    memcpy(buf + 4, &ts, 4);
+    memcpy(buf + 8, &net_ssrc, 4);
+
+    for (size_t i = 0; i < ROT_PAYLOAD_LEN; i++) {
+        buf[12 + i] = (uint8_t)(ROT_PAYLOAD_FIRST + i);
+    }
+
+    return 12 + ROT_PAYLOAD_LEN;
+}
+
+/* True if decrypted payload octets are present anywhere in the buffer. */
+static bool srtp_test_contains_payload(const uint8_t *buffer, size_t len)
+{
+    for (size_t i = 0; i + 2 < len; i++) {
+        if (buffer[i] == ROT_PAYLOAD_FIRST &&
+            buffer[i + 1] == (uint8_t)(ROT_PAYLOAD_FIRST + 1) &&
+            buffer[i + 2] == (uint8_t)(ROT_PAYLOAD_FIRST + 2)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/*
+ * Feed a protected packet to the receiver and require a specific failure.
+ *
+ * The packet is handed to the API in the buffer the test inspects afterwards:
+ * for in-place use the ciphertext is copied there first, otherwise the output
+ * buffer is distinct.  A rejected packet must not leave plaintext behind.
+ */
+static void srtp_test_expect_reject(srtp_t receiver,
+                                    const uint8_t *packet,
+                                    size_t packet_len,
+                                    srtp_err_status_t expected)
+{
+    uint8_t output[ROT_PACKET_BUF_LEN];
+    size_t output_len = sizeof(output);
+
+    memset(output, 0x5a, sizeof(output));
+    if (use_srtp_not_in_place_io_api) {
+        CHECK_RETURN(
+            srtp_unprotect(receiver, packet, packet_len, output, &output_len),
+            expected);
+    } else {
+        memcpy(output, packet, packet_len);
+        CHECK_RETURN(
+            srtp_unprotect(receiver, output, packet_len, output, &output_len),
+            expected);
+    }
+
+    CHECK(!srtp_test_contains_payload(output, sizeof(output)));
+}
+
+/*
+ * Feed a protected packet to the receiver and require acceptance.
+ */
+static void srtp_test_expect_accept(srtp_t receiver,
+                                    const uint8_t *packet,
+                                    size_t packet_len,
+                                    size_t plain_len)
+{
+    uint8_t output[ROT_PACKET_BUF_LEN];
+    size_t output_len = sizeof(output);
+
+    memset(output, 0x5a, sizeof(output));
+    if (use_srtp_not_in_place_io_api) {
+        CHECK_OK(
+            srtp_unprotect(receiver, packet, packet_len, output, &output_len));
+    } else {
+        memcpy(output, packet, packet_len);
+        CHECK_OK(
+            srtp_unprotect(receiver, output, packet_len, output, &output_len));
+    }
+
+    CHECK(output_len == plain_len);
+    CHECK(output[12] == ROT_PAYLOAD_FIRST);
+}
+
+static srtp_err_status_t srtp_test_rotation_policy(srtp_policy_t *policy,
+                                                   srtp_ssrc_t ssrc,
+                                                   srtp_profile_t profile,
+                                                   bool use_mki,
+                                                   size_t num_keys)
+{
+    CHECK_OK(srtp_policy_create(policy));
+    CHECK_OK(srtp_policy_set_profile(*policy, profile));
+    CHECK_OK(srtp_policy_set_sec_serv(*policy, sec_serv_conf_and_auth,
+                                      sec_serv_conf_and_auth));
+    CHECK_OK(srtp_policy_set_ssrc(*policy, ssrc));
+
+    if (use_mki) {
+        CHECK_OK(srtp_policy_use_mki(*policy, TEST_MKI_ID_SIZE));
+        CHECK_OK(policy_add_keys(*policy, test_keys, num_keys));
+    } else {
+        CHECK_OK(policy_set_key(*policy, test_key));
+    }
+
+    return srtp_err_status_ok;
+}
+
+/*
+ * Run one profile through the rotation scenarios.
+ */
+static srtp_err_status_t srtp_test_rotation_profile(srtp_profile_t profile)
+{
+    srtp_t snd;
+    srtp_t rcv;
+    srtp_policy_t sp;
+    srtp_policy_t rp;
+    uint8_t plain[ROT_PACKET_BUF_LEN];
+    uint8_t packet[ROT_PACKET_BUF_LEN];
+    uint8_t mutated[ROT_PACKET_BUF_LEN];
+    size_t len, pkt_len;
+    size_t tag_len;
+    size_t mki_off;
+    bool gcm = profile == srtp_profile_aead_aes_128_gcm;
+    const uint32_t ssrc_a = 0x0a0a0a0a;
+    const uint32_t ssrc_b = 0x0b0b0b0b;
+
+    tag_len = gcm ? 16 : 10;
+    /* distance from the end of the packet to the start of the MKI */
+    mki_off = gcm ? TEST_MKI_ID_SIZE : tag_len + TEST_MKI_ID_SIZE;
+
+    CHECK_OK(srtp_test_rotation_policy(
+        &sp, (srtp_ssrc_t){ ssrc_any_outbound, 0 }, profile, true, 2));
+    CHECK_OK(srtp_test_rotation_policy(
+        &rp, (srtp_ssrc_t){ ssrc_any_inbound, 0 }, profile, true, 2));
+    CHECK_OK(srtp_create(&snd, sp));
+    CHECK_OK(srtp_create(&rcv, rp));
+
+    /*
+     * Parallel SSRCs with identical sequence numbers but different keys must
+     * both be accepted: matching and replay state are per stream.
+     */
+    len = srtp_test_make_rtp(plain, 7, ssrc_a);
+    pkt_len = sizeof(packet);
+    CHECK_OK(call_srtp_protect2(snd, plain, len, &pkt_len, 0));
+    memcpy(packet, plain, pkt_len);
+    srtp_test_expect_accept(rcv, packet, pkt_len, len);
+
+    len = srtp_test_make_rtp(plain, 7, ssrc_b);
+    pkt_len = sizeof(packet);
+    CHECK_OK(call_srtp_protect2(snd, plain, len, &pkt_len, 1));
+    memcpy(packet, plain, pkt_len);
+    srtp_test_expect_accept(rcv, packet, pkt_len, len);
+
+    /*
+     * An unknown MKI on SSRC A must be rejected and must not advance A's
+     * replay window; the still-unseen sequence 8 must remain acceptable.
+     */
+    len = srtp_test_make_rtp(plain, 8, ssrc_a);
+    pkt_len = sizeof(packet);
+    CHECK_OK(call_srtp_protect2(snd, plain, len, &pkt_len, 0));
+    memcpy(packet, plain, pkt_len);
+    memcpy(mutated, packet, pkt_len);
+    memset(mutated + pkt_len - mki_off, 0x5c, TEST_MKI_ID_SIZE);
+    srtp_test_expect_reject(rcv, mutated, pkt_len, srtp_err_status_bad_mki);
+    srtp_test_expect_accept(rcv, packet, pkt_len, len);
+
+    /*
+     * A far-ahead sequence number with an unknown MKI must not move the
+     * replay window: the following legitimate packet would fall behind it.
+     */
+    len = srtp_test_make_rtp(plain, 40000, ssrc_a);
+    pkt_len = sizeof(packet);
+    CHECK_OK(call_srtp_protect2(snd, plain, len, &pkt_len, 0));
+    memcpy(packet, plain, pkt_len);
+    memcpy(mutated, packet, pkt_len);
+    memset(mutated + pkt_len - mki_off, 0x5c, TEST_MKI_ID_SIZE);
+    srtp_test_expect_reject(rcv, mutated, pkt_len, srtp_err_status_bad_mki);
+    srtp_test_expect_accept(rcv, packet, pkt_len, len);
+
+    /*
+     * Rotation boundary: the packet carries SSRC A's ciphertext produced
+     * with key 0 but names key 1's MKI.  It must fail authentication rather
+     * than be decrypted with either key set, and must leave no plaintext.
+     */
+    len = srtp_test_make_rtp(plain, 40001, ssrc_a);
+    pkt_len = sizeof(packet);
+    CHECK_OK(call_srtp_protect2(snd, plain, len, &pkt_len, 0));
+    memcpy(packet, plain, pkt_len);
+    memcpy(mutated, packet, pkt_len);
+    memcpy(mutated + pkt_len - mki_off, test_mki_id_2, TEST_MKI_ID_SIZE);
+    srtp_test_expect_reject(rcv, mutated, pkt_len, srtp_err_status_auth_fail);
+    srtp_test_expect_accept(rcv, packet, pkt_len, len);
+
+    /* a forged tag under a known MKI likewise leaves nothing behind */
+    len = srtp_test_make_rtp(plain, 40002, ssrc_a);
+    pkt_len = sizeof(packet);
+    CHECK_OK(call_srtp_protect2(snd, plain, len, &pkt_len, 0));
+    memcpy(packet, plain, pkt_len);
+    memcpy(mutated, packet, pkt_len);
+    mutated[pkt_len - mki_off - 1] ^= 0xff;
+    srtp_test_expect_reject(rcv, mutated, pkt_len, srtp_err_status_auth_fail);
+    srtp_test_expect_accept(rcv, packet, pkt_len, len);
+
+    /* a truncated packet is rejected and the stream still recovers */
+    len = srtp_test_make_rtp(plain, 40003, ssrc_a);
+    pkt_len = sizeof(packet);
+    CHECK_OK(call_srtp_protect2(snd, plain, len, &pkt_len, 0));
+    memcpy(packet, plain, pkt_len);
+    srtp_test_expect_reject(rcv, packet, pkt_len - 2, srtp_err_status_bad_mki);
+    srtp_test_expect_accept(rcv, packet, pkt_len, len);
+
+    CHECK_OK(srtp_dealloc(snd));
+    CHECK_OK(srtp_dealloc(rcv));
+    srtp_policy_destroy(sp);
+    srtp_policy_destroy(rp);
+
+    return srtp_err_status_ok;
+}
+
+/*
+ * Rejected first packets on a wildcard template stream must not poison the
+ * provisional stream: the SSRC can still be brought up by a valid packet, a
+ * second SSRC is unaffected, and the first SSRC keeps its own replay state.
+ */
+/*
+ * SRTCP mirror of the RTP rotation checks.  SRTCP always authenticates, so a
+ * rejected packet must not be recorded in the replay database either; the
+ * MKI sits in a different place than for SRTP, before the SRTCP tag for
+ * AES-CM and after it for AES-GCM.
+ */
+static srtp_err_status_t srtp_test_rotation_rtcp(srtp_profile_t profile)
+{
+    srtp_t snd;
+    srtp_t rcv;
+    srtp_policy_t sp;
+    srtp_policy_t rp;
+    uint8_t plain[ROT_PACKET_BUF_LEN];
+    uint8_t packet[ROT_PACKET_BUF_LEN];
+    uint8_t mutated[ROT_PACKET_BUF_LEN];
+    uint8_t output[ROT_PACKET_BUF_LEN];
+    uint32_t net_ssrc;
+    size_t len, pkt_len, out_len;
+    size_t mki_off;
+    bool gcm = profile == srtp_profile_aead_aes_128_gcm;
+    const uint32_t ssrc_a = 0x14141414;
+
+    /* distance from the end of the packet to the start of the MKI */
+    mki_off = gcm ? TEST_MKI_ID_SIZE : 10 + TEST_MKI_ID_SIZE;
+
+    CHECK_OK(srtp_test_rotation_policy(
+        &sp, (srtp_ssrc_t){ ssrc_any_outbound, 0 }, profile, true, 2));
+    CHECK_OK(srtp_test_rotation_policy(
+        &rp, (srtp_ssrc_t){ ssrc_any_inbound, 0 }, profile, true, 2));
+    CHECK_OK(srtp_create(&snd, sp));
+    CHECK_OK(srtp_create(&rcv, rp));
+
+    net_ssrc = htonl(ssrc_a);
+    memset(plain, 0, sizeof(plain));
+    plain[0] = 0x81; /* V=2, RC=1 */
+    plain[1] = 0xc8; /* SR */
+    plain[3] = (uint8_t)(ROT_PAYLOAD_LEN / 4);
+    memcpy(plain + 4, &net_ssrc, 4);
+    for (size_t i = 0; i < ROT_PAYLOAD_LEN; i++) {
+        plain[8 + i] = (uint8_t)(ROT_PAYLOAD_FIRST + i);
+    }
+    len = 8 + ROT_PAYLOAD_LEN;
+
+    /*
+     * Two packets with consecutive SRTCP indices.  The first is accepted; the
+     * second, carrying an unknown MKI, must be rejected without recording its
+     * index, so it is still accepted once the MKI is restored.
+     */
+    pkt_len = sizeof(packet);
+    CHECK_OK(call_srtp_protect_rtcp2(snd, plain, len, &pkt_len, 0));
+    memcpy(packet, plain, pkt_len);
+
+    memcpy(output, packet, pkt_len);
+    out_len = sizeof(output);
+    CHECK_OK(call_srtp_unprotect_rtcp2(rcv, output, pkt_len, &out_len));
+    CHECK(out_len == len);
+    CHECK(output[8] == ROT_PAYLOAD_FIRST);
+
+    pkt_len = sizeof(packet);
+    CHECK_OK(call_srtp_protect_rtcp2(snd, plain, len, &pkt_len, 0));
+    memcpy(packet, plain, pkt_len);
+
+    memcpy(mutated, packet, pkt_len);
+    memset(mutated + pkt_len - mki_off, 0x5c, TEST_MKI_ID_SIZE);
+    memcpy(output, mutated, pkt_len);
+    memset(output + pkt_len, 0x5a, sizeof(output) - pkt_len);
+    out_len = sizeof(output);
+    CHECK_RETURN(call_srtp_unprotect_rtcp2(rcv, output, pkt_len, &out_len),
+                 srtp_err_status_bad_mki);
+    CHECK(!srtp_test_contains_payload(output, sizeof(output)));
+
+    /* its index was not consumed: the restored packet is accepted */
+    memcpy(output, packet, pkt_len);
+    out_len = sizeof(output);
+    CHECK_OK(call_srtp_unprotect_rtcp2(rcv, output, pkt_len, &out_len));
+    CHECK(out_len == len);
+
+    /* replaying it now must fail */
+    memcpy(output, packet, pkt_len);
+    out_len = sizeof(output);
+    CHECK_RETURN(call_srtp_unprotect_rtcp2(rcv, output, pkt_len, &out_len),
+                 srtp_err_status_replay_fail);
+
+    CHECK_OK(srtp_dealloc(snd));
+    CHECK_OK(srtp_dealloc(rcv));
+    srtp_policy_destroy(sp);
+    srtp_policy_destroy(rp);
+
+    return srtp_err_status_ok;
+}
+
+static srtp_err_status_t srtp_test_rotation_wildcard(srtp_profile_t profile)
+{
+    srtp_t snd;
+    srtp_t rcv;
+    srtp_policy_t sp;
+    srtp_policy_t rp;
+    uint8_t plain[ROT_PACKET_BUF_LEN];
+    uint8_t packet[ROT_PACKET_BUF_LEN];
+    uint8_t mutated[ROT_PACKET_BUF_LEN];
+    size_t len, pkt_len;
+    size_t mki_off;
+    const uint32_t ssrc_a = 0x0c0c0c0c;
+    const uint32_t ssrc_b = 0x0d0d0d0d;
+    bool gcm = profile == srtp_profile_aead_aes_128_gcm;
+
+    mki_off = gcm ? TEST_MKI_ID_SIZE : 10 + TEST_MKI_ID_SIZE;
+
+    CHECK_OK(srtp_test_rotation_policy(
+        &sp, (srtp_ssrc_t){ ssrc_any_outbound, 0 }, profile, true, 2));
+    CHECK_OK(srtp_test_rotation_policy(
+        &rp, (srtp_ssrc_t){ ssrc_any_inbound, 0 }, profile, true, 2));
+    CHECK_OK(srtp_create(&snd, sp));
+    CHECK_OK(srtp_create(&rcv, rp));
+
+    /* the first packet of SSRC A has an unknown MKI and is rejected */
+    len = srtp_test_make_rtp(plain, 3, ssrc_a);
+    pkt_len = sizeof(packet);
+    CHECK_OK(call_srtp_protect2(snd, plain, len, &pkt_len, 0));
+    memcpy(packet, plain, pkt_len);
+    memcpy(mutated, packet, pkt_len);
+    memset(mutated + pkt_len - mki_off, 0x5c, TEST_MKI_ID_SIZE);
+    srtp_test_expect_reject(rcv, mutated, pkt_len, srtp_err_status_bad_mki);
+
+    /* SSRC A comes up normally with the same sequence number */
+    srtp_test_expect_accept(rcv, packet, pkt_len, len);
+
+    /* SSRC B starts independently, with the same sequence number */
+    len = srtp_test_make_rtp(plain, 3, ssrc_b);
+    pkt_len = sizeof(packet);
+    CHECK_OK(call_srtp_protect2(snd, plain, len, &pkt_len, 1));
+    memcpy(packet, plain, pkt_len);
+    srtp_test_expect_accept(rcv, packet, pkt_len, len);
+
+    /* SSRC A continues from its own replay state */
+    len = srtp_test_make_rtp(plain, 4, ssrc_a);
+    pkt_len = sizeof(packet);
+    CHECK_OK(call_srtp_protect2(snd, plain, len, &pkt_len, 0));
+    memcpy(packet, plain, pkt_len);
+    srtp_test_expect_accept(rcv, packet, pkt_len, len);
+
+    CHECK_OK(srtp_dealloc(snd));
+    CHECK_OK(srtp_dealloc(rcv));
+    srtp_policy_destroy(sp);
+    srtp_policy_destroy(rp);
+
+    return srtp_err_status_ok;
+}
+
+/*
+ * Non-MKI callers keep their previous behaviour: a single key set is used
+ * directly, several parallel SSRCs stay independent, and a later valid packet
+ * is still processed after a rejected one.
+ */
+static srtp_err_status_t srtp_test_rotation_single_key(void)
+{
+    srtp_t snd;
+    srtp_t rcv;
+    srtp_policy_t sp;
+    srtp_policy_t rp;
+    uint8_t plain[ROT_PACKET_BUF_LEN];
+    uint8_t packet[ROT_PACKET_BUF_LEN];
+    uint8_t mutated[ROT_PACKET_BUF_LEN];
+    const uint32_t ss_parallel[2] = { 0x0e0e0e0e, 0x0f0f0f0f };
+    size_t len, pkt_len;
+
+    CHECK_OK(
+        srtp_test_rotation_policy(&sp, (srtp_ssrc_t){ ssrc_any_outbound, 0 },
+                                  srtp_profile_aes128_cm_sha1_80, false, 0));
+    CHECK_OK(
+        srtp_test_rotation_policy(&rp, (srtp_ssrc_t){ ssrc_any_inbound, 0 },
+                                  srtp_profile_aes128_cm_sha1_80, false, 0));
+    CHECK_OK(srtp_create(&snd, sp));
+    CHECK_OK(srtp_create(&rcv, rp));
+
+    for (size_t k = 0; k < sizeof(ss_parallel) / sizeof(ss_parallel[0]); k++) {
+        for (uint16_t seq = 5; seq < 7; seq++) {
+            len = srtp_test_make_rtp(plain, seq, ss_parallel[k]);
+            pkt_len = sizeof(packet);
+            CHECK_OK(call_srtp_protect2(snd, plain, len, &pkt_len, 0));
+            memcpy(packet, plain, pkt_len);
+            srtp_test_expect_accept(rcv, packet, pkt_len, len);
+        }
+    }
+
+    /* a forged tag is rejected without plaintext, and the stream recovers */
+    len = srtp_test_make_rtp(plain, 7, ss_parallel[0]);
+    pkt_len = sizeof(packet);
+    CHECK_OK(call_srtp_protect2(snd, plain, len, &pkt_len, 0));
+    memcpy(packet, plain, pkt_len);
+    memcpy(mutated, packet, pkt_len);
+    mutated[pkt_len - 1] ^= 0xff;
+    srtp_test_expect_reject(rcv, mutated, pkt_len, srtp_err_status_auth_fail);
+    srtp_test_expect_accept(rcv, packet, pkt_len, len);
+
+    CHECK_OK(srtp_dealloc(snd));
+    CHECK_OK(srtp_dealloc(rcv));
+    srtp_policy_destroy(sp);
+    srtp_policy_destroy(rp);
+
+    return srtp_err_status_ok;
+}
+
+srtp_err_status_t srtp_test_key_rotation_receive(void)
+{
+    bool saved_io_mode = use_srtp_not_in_place_io_api;
+
+    for (int io = 0; io < 2; io++) {
+        use_srtp_not_in_place_io_api = io == 1;
+
+        CHECK_OK(srtp_test_rotation_profile(srtp_profile_aes128_cm_sha1_80));
+#ifdef HAVE_GCM
+        CHECK_OK(srtp_test_rotation_profile(srtp_profile_aead_aes_128_gcm));
+#endif
+        CHECK_OK(srtp_test_rotation_wildcard(srtp_profile_aes128_cm_sha1_80));
+        CHECK_OK(srtp_test_rotation_rtcp(srtp_profile_aes128_cm_sha1_80));
+#ifdef HAVE_GCM
+        CHECK_OK(srtp_test_rotation_wildcard(srtp_profile_aead_aes_128_gcm));
+        CHECK_OK(srtp_test_rotation_rtcp(srtp_profile_aead_aes_128_gcm));
+#endif
+        CHECK_OK(srtp_test_rotation_single_key());
+    }
+
+    use_srtp_not_in_place_io_api = saved_io_mode;
 
     return srtp_err_status_ok;
 }

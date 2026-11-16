@@ -1219,16 +1219,57 @@ static inline size_t full_auth_key_length(const srtp_auth_type_t *auth)
     }
 }
 
+/*
+ * A session key set is only usable once the cipher and auth contexts it
+ * references have been initialized.  A partially initialized set must never be
+ * selected, and must never cause another (for instance the first) set to be
+ * used in its place.
+ */
+static bool srtp_session_keys_usable(const srtp_session_keys_t *session_keys,
+                                     bool rtcp)
+{
+    if (session_keys == NULL) {
+        return false;
+    }
+
+    if (rtcp) {
+        return session_keys->rtcp_cipher != NULL &&
+               session_keys->rtcp_auth != NULL;
+    }
+
+    return session_keys->rtp_cipher != NULL && session_keys->rtp_auth != NULL;
+}
+
 srtp_err_status_t srtp_get_session_keys(srtp_stream_ctx_t *stream,
                                         size_t mki_index,
                                         srtp_session_keys_t **session_keys)
 {
+    if (stream->session_keys == NULL || stream->num_master_keys == 0) {
+        return srtp_err_status_no_ctx;
+    }
+
     if (stream->use_mki) {
         if (mki_index >= stream->num_master_keys) {
             return srtp_err_status_bad_mki;
         }
+        if (!srtp_session_keys_usable(&stream->session_keys[mki_index],
+                                      false) ||
+            !srtp_session_keys_usable(&stream->session_keys[mki_index], true)) {
+            return srtp_err_status_bad_mki;
+        }
         *session_keys = &stream->session_keys[mki_index];
         return srtp_err_status_ok;
+    }
+
+    /*
+     * Without MKI there is exactly one key set and key-sharing is not
+     * ambiguous; refusing anything else keeps a single-key session from
+     * silently picking a "default" key out of a misconfigured stream.
+     */
+    if (stream->num_master_keys != 1 ||
+        !srtp_session_keys_usable(&stream->session_keys[0], false) ||
+        !srtp_session_keys_usable(&stream->session_keys[0], true)) {
+        return srtp_err_status_no_ctx;
     }
 
     *session_keys = &stream->session_keys[0];
@@ -2011,6 +2052,16 @@ static srtp_err_status_t srtp_get_session_keys_for_packet(
     }
 
     if (!stream->use_mki) {
+        /*
+         * Single-key streams keep working exactly as before, but the one key
+         * set still has to be complete before it is used.
+         */
+        if (stream->num_master_keys != 1 ||
+            !srtp_session_keys_usable(&stream->session_keys[0], false) ||
+            !srtp_session_keys_usable(&stream->session_keys[0], true)) {
+            return srtp_err_status_no_ctx;
+        }
+
         *session_keys = &stream->session_keys[0];
         return srtp_err_status_ok;
     }
@@ -2030,6 +2081,16 @@ static srtp_err_status_t srtp_get_session_keys_for_packet(
     mki_start_location -= stream->mki_size;
 
     for (size_t i = 0; i < stream->num_master_keys; i++) {
+        if (stream->session_keys[i].mki_id == NULL ||
+            !srtp_session_keys_usable(&stream->session_keys[i], false) ||
+            !srtp_session_keys_usable(&stream->session_keys[i], true)) {
+            /*
+             * A key set with a bad parameter must neither be selected nor
+             * stand in the way of the key sets that are still valid.
+             */
+            continue;
+        }
+
         if (memcmp(hdr + mki_start_location, stream->session_keys[i].mki_id,
                    stream->mki_size) == 0) {
             *session_keys = &stream->session_keys[i];
@@ -2037,7 +2098,32 @@ static srtp_err_status_t srtp_get_session_keys_for_packet(
         }
     }
 
+    /*
+     * The packet's MKI is not one of the keys this stream can use.  There is
+     * deliberately no fallback to session_keys[0]: doing so would decrypt with
+     * the wrong parameter set during a key rotation.
+     */
     return srtp_err_status_bad_mki;
+}
+
+/*
+ * Return a key set whose cipher/auth parameters can be inspected, preferring
+ * fully initialized ones.  Used only to learn protocol-level constants (tag
+ * size, cipher family) that are shared by every key set of the stream, so a
+ * partially initialized set is never dereferenced when a good one exists.
+ * Returns NULL when no key set is usable at all.
+ */
+static const srtp_session_keys_t *srtp_reference_session_keys(
+    const srtp_stream_ctx_t *stream)
+{
+    for (size_t i = 0; i < stream->num_master_keys; i++) {
+        if (srtp_session_keys_usable(&stream->session_keys[i], false) &&
+            srtp_session_keys_usable(&stream->session_keys[i], true)) {
+            return &stream->session_keys[i];
+        }
+    }
+
+    return NULL;
 }
 
 /*
@@ -2055,20 +2141,25 @@ static srtp_err_status_t srtp_get_session_keys_for_rtp_packet(
     srtp_session_keys_t **session_keys)
 {
     size_t trailing_len;
+    const srtp_session_keys_t *ref;
 
     if (stream->num_master_keys == 0 || stream->session_keys == NULL) {
         return srtp_err_status_no_ctx;
     }
 
-    if (stream->session_keys[0].rtp_cipher->algorithm == SRTP_AES_GCM_128 ||
-        stream->session_keys[0].rtp_cipher->algorithm == SRTP_AES_GCM_256) {
+    ref = srtp_reference_session_keys(stream);
+    if (ref == NULL) {
+        return srtp_err_status_no_ctx;
+    }
+
+    if (ref->rtp_cipher->algorithm == SRTP_AES_GCM_128 ||
+        ref->rtp_cipher->algorithm == SRTP_AES_GCM_256) {
         trailing_len =
             (stream->rcc_mode == srtp_rcc_mode_3 && rcc_carry) ? 4 : 0;
     } else if (stream->rcc_mode == srtp_rcc_mode_1 && !rcc_carry) {
         trailing_len = 0;
     } else {
-        trailing_len =
-            srtp_auth_get_tag_length(stream->session_keys[0].rtp_auth);
+        trailing_len = srtp_auth_get_tag_length(ref->rtp_auth);
     }
 
     return srtp_get_session_keys_for_packet(stream, hdr, pkt_octet_len,
@@ -2082,21 +2173,42 @@ static srtp_err_status_t srtp_get_session_keys_for_rtcp_packet(
     srtp_session_keys_t **session_keys)
 {
     size_t tag_len = 0;
+    const srtp_session_keys_t *ref;
 
     if (stream->num_master_keys == 0 || stream->session_keys == NULL) {
         return srtp_err_status_no_ctx;
     }
 
+    ref = srtp_reference_session_keys(stream);
+    if (ref == NULL) {
+        return srtp_err_status_no_ctx;
+    }
+
     // Determine the authentication tag size
-    if (stream->session_keys[0].rtcp_cipher->algorithm == SRTP_AES_GCM_128 ||
-        stream->session_keys[0].rtcp_cipher->algorithm == SRTP_AES_GCM_256) {
+    if (ref->rtcp_cipher->algorithm == SRTP_AES_GCM_128 ||
+        ref->rtcp_cipher->algorithm == SRTP_AES_GCM_256) {
         tag_len = 0;
     } else {
-        tag_len = srtp_auth_get_tag_length(stream->session_keys[0].rtcp_auth);
+        tag_len = srtp_auth_get_tag_length(ref->rtcp_auth);
     }
 
     return srtp_get_session_keys_for_packet(stream, hdr, pkt_octet_len, tag_len,
                                             session_keys);
+}
+
+/*
+ * A rejected packet must not leave partial plaintext in the caller's output
+ * buffer.  A GCM decrypt in particular writes the whole payload before it can
+ * report that the authentication tag did not match, so the region it produced
+ * has to be erased before the failure is returned.  Erasing keeps the receive
+ * path allocation free and works identically for in-place and out-of-place
+ * callers.
+ */
+static void srtp_scrub_plaintext(uint8_t *rtp, size_t start, size_t end)
+{
+    if (end > start) {
+        octet_string_set_to_zero(rtp + start, end - start);
+    }
 }
 
 static srtp_err_status_t srtp_estimate_index(srtp_rdbx_t *rdbx,
@@ -2518,33 +2630,21 @@ static srtp_err_status_t srtp_unprotect_aead(srtp_ctx_t *ctx,
         return srtp_err_status_buffer_small;
     }
 
-    /* if not-inplace then need to copy full rtp header */
-    if (srtp != rtp) {
-        memcpy(rtp, srtp, enc_start);
-    }
-
     /*
-     * update the key usage limit, and check it to make sure that we
-     * didn't just hit either the soft limit or the hard limit, and call
-     * the event handler if we hit either.
+     * Cryptex needs the header in the destination buffer before the CSRC
+     * list and header extension can be put back in order; without it the
+     * header copy can wait until the tag has been verified, which keeps a
+     * rejected packet from writing anything at all.
      */
-    switch (srtp_key_limit_update(session_keys->limit)) {
-    case srtp_key_event_normal:
-        break;
-    case srtp_key_event_soft_limit:
-        srtp_handle_event(ctx, stream, event_key_soft_limit);
-        break;
-    case srtp_key_event_hard_limit:
-        srtp_handle_event(ctx, stream, event_key_hard_limit);
-        return srtp_err_status_key_expired;
-    default:
-        break;
+    if (cryptex_inuse && srtp != rtp) {
+        memcpy(rtp, srtp, enc_start);
     }
 
     if (cryptex_inuse) {
         status = srtp_cryptex_unprotect(cryptex_inplace, hdr, rtp,
                                         session_keys->rtp_cipher);
         if (status) {
+            srtp_scrub_plaintext(rtp, 0, enc_start);
             return status;
         }
     }
@@ -2555,6 +2655,7 @@ static srtp_err_status_t srtp_unprotect_aead(srtp_ctx_t *ctx,
     aad_len = enc_start;
     status = srtp_cipher_set_aad(session_keys->rtp_cipher, srtp, aad_len);
     if (status) {
+        srtp_scrub_plaintext(rtp, 0, enc_start);
         return srtp_err_status_cipher_fail;
     }
 
@@ -2563,9 +2664,24 @@ static srtp_err_status_t srtp_unprotect_aead(srtp_ctx_t *ctx,
     size_t outlen = *rtp_len - enc_start;
     status = srtp_cipher_decrypt(session_keys->rtp_cipher, srtp + enc_start,
                                  enc_octet_len, rtp + enc_start, &outlen);
-    enc_octet_len = outlen;
     if (status) {
+        /*
+         * GCM writes the plaintext before it can verify the tag, so a
+         * rejected packet may already have produced output.  Erase exactly
+         * the octets a decryption of this ciphertext could have written: a
+         * failed receive must not hand back any plaintext.
+         */
+        srtp_scrub_plaintext(rtp, 0, enc_start + (enc_octet_len - tag_len));
+        if (cryptex_inuse) {
+            srtp_cryptex_unprotect_cleanup(cryptex_inplace, hdr, rtp);
+        }
         return status;
+    }
+
+    enc_octet_len = outlen;
+
+    if (srtp != rtp && !cryptex_inuse) {
+        memcpy(rtp, srtp, enc_start);
     }
 
     if (hdr->x == 1 && session_keys->rtp_xtn_hdr_cipher) {
@@ -2575,12 +2691,37 @@ static srtp_err_status_t srtp_unprotect_aead(srtp_ctx_t *ctx,
         status = srtp_process_header_encryption(
             stream, srtp_get_rtp_xtn_hdr(hdr, rtp), session_keys);
         if (status) {
+            srtp_scrub_plaintext(rtp, 0, enc_start + enc_octet_len);
+            if (cryptex_inuse) {
+                srtp_cryptex_unprotect_cleanup(cryptex_inplace, hdr, rtp);
+            }
             return status;
         }
     }
 
     if (cryptex_inuse) {
         srtp_cryptex_unprotect_cleanup(cryptex_inplace, hdr, rtp);
+    }
+
+    /*
+     * update the key usage limit, and check it to make sure that we
+     * didn't just hit either the soft limit or the hard limit, and call
+     * the event handler if we hit either.  Only authenticated packets are
+     * charged against the key, so a replayed or forged packet cannot use
+     * up the key's budget.
+     */
+    switch (srtp_key_limit_update(session_keys->limit)) {
+    case srtp_key_event_normal:
+        break;
+    case srtp_key_event_soft_limit:
+        srtp_handle_event(ctx, stream, event_key_soft_limit);
+        break;
+    case srtp_key_event_hard_limit:
+        srtp_handle_event(ctx, stream, event_key_hard_limit);
+        srtp_scrub_plaintext(rtp, 0, enc_start + enc_octet_len);
+        return srtp_err_status_key_expired;
+    default:
+        break;
     }
 
     /*
@@ -3253,11 +3394,6 @@ srtp_err_status_t srtp_unprotect(srtp_t ctx,
         return srtp_err_status_buffer_small;
     }
 
-    /* if not-inplace then need to copy full rtp header */
-    if (srtp != rtp) {
-        memcpy(rtp, srtp, enc_start);
-    }
-
     /*
      * if we're providing authentication, set the auth_start and auth_tag
      * pointers to the proper locations; otherwise, set auth_start to NULL
@@ -3331,21 +3467,12 @@ srtp_err_status_t srtp_unprotect(srtp_t ctx,
     }
 
     /*
-     * update the key usage limit, and check it to make sure that we
-     * didn't just hit either the soft limit or the hard limit, and call
-     * the event handler if we hit either.
+     * The packet passed authentication.  Only now is the caller's output
+     * buffer touched, so a rejected packet leaves no partial plaintext.
      */
-    switch (srtp_key_limit_update(session_keys->limit)) {
-    case srtp_key_event_normal:
-        break;
-    case srtp_key_event_soft_limit:
-        srtp_handle_event(ctx, stream, event_key_soft_limit);
-        break;
-    case srtp_key_event_hard_limit:
-        srtp_handle_event(ctx, stream, event_key_hard_limit);
-        return srtp_err_status_key_expired;
-    default:
-        break;
+    if (srtp != rtp) {
+        /* if not-inplace then need to copy full rtp header */
+        memcpy(rtp, srtp, enc_start);
     }
 
     if (hdr->x == 1 && session_keys->rtp_xtn_hdr_cipher) {
@@ -3353,6 +3480,8 @@ srtp_err_status_t srtp_unprotect(srtp_t ctx,
         status = srtp_process_header_encryption(
             stream, srtp_get_rtp_xtn_hdr(hdr, rtp), session_keys);
         if (status) {
+            /* only the header has been written so far */
+            srtp_scrub_plaintext(rtp, 0, enc_start);
             return status;
         }
     }
@@ -3361,18 +3490,29 @@ srtp_err_status_t srtp_unprotect(srtp_t ctx,
         status = srtp_cryptex_unprotect(cryptex_inplace, hdr, rtp,
                                         session_keys->rtp_cipher);
         if (status) {
+            srtp_scrub_plaintext(rtp, 0, enc_start);
             return status;
         }
     }
 
     /* if we're decrypting, add keystream into ciphertext */
     if (stream->rtp_services & sec_serv_conf) {
+        size_t decrypt_len = enc_octet_len;
         status =
             srtp_cipher_decrypt(session_keys->rtp_cipher, srtp + enc_start,
-                                enc_octet_len, rtp + enc_start, &enc_octet_len);
+                                enc_octet_len, rtp + enc_start, &decrypt_len);
         if (status) {
+            /*
+             * The cipher may have written part of the payload before
+             * failing; erase the whole region it was asked to fill.
+             */
+            srtp_scrub_plaintext(rtp, 0, enc_start + enc_octet_len);
+            if (cryptex_inuse) {
+                srtp_cryptex_unprotect_cleanup(cryptex_inplace, hdr, rtp);
+            }
             return srtp_err_status_cipher_fail;
         }
+        enc_octet_len = decrypt_len;
     } else if (rtp != srtp) {
         /* if no encryption and not-inplace then need to copy rest of packet */
         memcpy(rtp + enc_start, srtp + enc_start, enc_octet_len);
@@ -4270,10 +4410,10 @@ static srtp_err_status_t srtp_unprotect_rtcp_aead(
         return srtp_err_status_buffer_small;
     }
 
-    /* if not inplace need to copy rtcp header */
-    if (srtcp != rtcp) {
-        memcpy(rtcp, srtcp, enc_start);
-    }
+    /*
+     * The header is copied into the caller's buffer only once the packet is
+     * accepted, so a rejected packet writes nothing.
+     */
 
     /*
      * Set the AAD for GCM mode
@@ -4318,7 +4458,19 @@ static srtp_err_status_t srtp_unprotect_rtcp_aead(
             srtp_cipher_decrypt(session_keys->rtcp_cipher, srtcp + enc_start,
                                 enc_octet_len, rtcp + enc_start, &out_len);
         if (status) {
+            /*
+             * GCM writes the plaintext before verifying the tag; erase what
+             * it produced so a rejected packet leaves no partial plaintext.
+             * The ciphertext length includes the tag, which produces no
+             * plaintext.
+             */
+            srtp_scrub_plaintext(rtcp, 0,
+                                 enc_start + (enc_octet_len - tag_len));
             return status;
+        }
+        /* the plaintext header was held back until the tag verified */
+        if (srtcp != rtcp) {
+            memcpy(rtcp, srtcp, enc_start);
         }
     } else {
         /*
@@ -4333,8 +4485,7 @@ static srtp_err_status_t srtp_unprotect_rtcp_aead(
 
         /* if no encryption and not-inplace then copy the authenticated data */
         if (rtcp != srtcp) {
-            memcpy(rtcp + enc_start, srtcp + enc_start,
-                   enc_octet_len - tag_len);
+            memcpy(rtcp, srtcp, enc_start + enc_octet_len - tag_len);
         }
     }
 
@@ -4865,12 +5016,15 @@ srtp_err_status_t srtp_unprotect_rtcp(srtp_t ctx,
 
     /* if we're decrypting, exor keystream into the message */
     if (sec_serv_confidentiality) {
-        status = srtp_cipher_decrypt(session_keys->rtcp_cipher,
-                                     srtcp + enc_start, enc_octet_len,
-                                     rtcp + enc_start, &enc_octet_len);
+        size_t decrypt_len = enc_octet_len;
+        status =
+            srtp_cipher_decrypt(session_keys->rtcp_cipher, srtcp + enc_start,
+                                enc_octet_len, rtcp + enc_start, &decrypt_len);
         if (status) {
+            srtp_scrub_plaintext(rtcp, 0, enc_start + enc_octet_len);
             return srtp_err_status_cipher_fail;
         }
+        enc_octet_len = decrypt_len;
     } else if (srtcp != rtcp) {
         /* if no encryption and not-inplace then need to copy rest of packet */
         memcpy(rtcp + enc_start, srtcp + enc_start, enc_octet_len);

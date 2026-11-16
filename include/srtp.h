@@ -784,6 +784,16 @@ srtp_err_status_t srtp_protect(srtp_t ctx,
  * need not be consecutive, but they @b must be out of order by less
  * than 2^15 = 32,768 packets.
  *
+ * Packet processing is atomic with respect to failures.  A packet that is
+ * rejected (unknown MKI, failed authentication, replay, malformed length, or
+ * a key that is not usable) does not advance the replay state of its stream,
+ * does not consume key usage budget, and leaves no plaintext in the output
+ * buffer; the output buffer is only written for a packet that is accepted.
+ * Streams are matched and tracked per SSRC, so packets arriving in parallel
+ * on different SSRCs, including during key rotation, are processed
+ * independently.  A rejected packet does not disturb the processing of later
+ * valid packets.
+ *
  * @warning This function assumes that the SRTP packet is aligned on a
  * 32-bit boundary.
  *
@@ -1067,6 +1077,11 @@ srtp_err_status_t srtp_protect_rtcp(srtp_t ctx,
  * to the resulting RTCP packet and *rtcp_len is the number of octets
  * in that packet; otherwise, no assumptions should be made about the
  * value of either data elements.
+ *
+ * As with srtp_unprotect(), processing is atomic with respect to failures: a
+ * rejected packet does not advance the replay state, does not select a
+ * default key when its MKI is unknown, and leaves no plaintext in the output
+ * buffer.
  *
  * @warning This function assumes that the SRTCP packet is aligned on a
  * 32-bit boundary.
