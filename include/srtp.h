@@ -776,9 +776,19 @@ srtp_err_status_t srtp_protect(srtp_t ctx,
  * the Secure RTP protection of the SRTP packet pointed to by srtp
  * (which has length srtp_len), using the SRTP context ctx.  If
  * srtp_err_status_ok is returned, then rtp points to the resulting
- * RTP packet and *rtp_len is the number of octets in that packet;
- * otherwise, no assumptions should be made about the value of either
- * data elements.
+ * RTP packet and *rtp_len is the number of octets in that packet.
+ *
+ * On any error the result is deliberately neutral, whether the packet was
+ * processed in place (rtp == srtp) or into a separate buffer: *rtp_len is set
+ * to zero and no part of the output buffer that the call could have written
+ * is left holding packet-derived data (the affected region is erased).  A
+ * caller that ignores the status therefore cannot mistake unauthenticated
+ * content for a plaintext RTP packet.  A rejected packet also does not advance
+ * the stream's replay state and does not consume key usage budget, so later
+ * valid packets are processed as if it had never arrived.  This holds for a
+ * bad authentication tag as well as for a packet rejected before the tag could
+ * be checked (a malformed or too-short packet, a bad MKI, a replay, or an
+ * output buffer that is too small).
  *
  * The sequence numbers of the RTP packets presented to this function
  * need not be consecutive, but they @b must be out of order by less
@@ -800,8 +810,7 @@ srtp_err_status_t srtp_protect(srtp_t ctx,
  *
  * @param srtp_len is a pointer to the length of the rtp buffer before the
  * function call, and of the complete RTP packet after the call, if
- * srtp_err_status_ok was returned. Otherwise, the value of the data to which
- * it points is undefined.
+ * srtp_err_status_ok was returned. On error it is set to zero.
  *
  * @return
  *    - srtp_err_status_ok          if the RTP packet is valid.
@@ -1065,8 +1074,15 @@ srtp_err_status_t srtp_protect_rtcp(srtp_t ctx,
  * by srtcp (which has length srtcp_len), using the SRTP session
  * context ctx.  If srtp_err_status_ok is returned, then rtcp points
  * to the resulting RTCP packet and *rtcp_len is the number of octets
- * in that packet; otherwise, no assumptions should be made about the
- * value of either data elements.
+ * in that packet.
+ *
+ * As with srtp_unprotect(), an error leaves a deliberately neutral result
+ * whatever the buffer aliasing: *rtcp_len is set to zero and no part of the
+ * output buffer that the call could have written is left holding
+ * packet-derived data.  A rejected packet does not advance the replay state
+ * and does not consume key usage budget, whether it failed authentication or
+ * was rejected earlier (malformed length, replay, bad MKI, or an output
+ * buffer that is too small).
  *
  * @warning This function assumes that the SRTCP packet is aligned on a
  * 32-bit boundary.
@@ -1085,8 +1101,7 @@ srtp_err_status_t srtp_protect_rtcp(srtp_t ctx,
  *
  * @param rtcp_len is a pointer to the length of the rtcp buffer before the
  * function call, and of the complete RTCP packet after the call, if
- * srtp_err_status_ok was returned. Otherwise, the value of the data to which
- * it points is undefined.
+ * srtp_err_status_ok was returned. On error it is set to zero.
  *
  * @return
  *    - srtp_err_status_ok          if the RTCP packet is valid.

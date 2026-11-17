@@ -117,6 +117,8 @@ srtp_err_status_t srtp_test_gcm_unprotect_not_in_place(void);
 srtp_err_status_t srtp_test_rtcp_gcm_unprotect_not_in_place(void);
 #endif
 
+srtp_err_status_t srtp_test_unprotect_failure_contract(void);
+
 srtp_err_status_t srtp_test_remove_stream(void);
 
 srtp_err_status_t srtp_test_update(void);
@@ -1059,6 +1061,14 @@ int main(int argc, char *argv[])
             exit(1);
         }
 #endif
+
+        printf("testing unprotect failure contract()...");
+        if (srtp_test_unprotect_failure_contract() == srtp_err_status_ok) {
+            printf("passed\n");
+        } else {
+            printf("failed\n");
+            exit(1);
+        }
     }
 
     if (do_stream_list) {
@@ -4288,6 +4298,370 @@ srtp_err_status_t srtp_test_rtcp_gcm_unprotect_not_in_place(void)
 #endif
 
 /*
+ * Verify that a rejected unprotect call leaves nothing the caller could read
+ * as plaintext, and that the choice of buffer aliasing does not change that.
+ *
+ * For AES-CM/HMAC and, when available, AES-GCM, RTP packets are rejected in
+ * three ways - a corrupted authentication tag, an output buffer that is too
+ * small, and a truncated packet - and SRTCP packets with a corrupted tag.  In
+ * every case the call must report a failure, set the output length to zero,
+ * and leave no payload octet in the output buffer whether the call was made in
+ * place (rtp == srtp) or into a separate buffer.  The stream's replay state
+ * must not move, and the following genuine packet - including re-presenting
+ * the packet whose ciphertext was rejected - must still be accepted and
+ * decrypt correctly.
+ */
+#define FAILCON_PAYLOAD_LEN 24
+#define FAILCON_BUF_LEN 256
+
+static void failcon_fill_rtp(uint8_t *pkt, uint32_t ssrc, uint16_t seq)
+{
+    uint32_t net_ssrc = htonl(ssrc);
+    uint16_t net_seq = htons(seq);
+    uint32_t ts = 0;
+
+    memset(pkt, 0, 12 + FAILCON_PAYLOAD_LEN);
+    pkt[0] = 0x80; /* V=2 */
+    pkt[1] = 0x0f;
+    memcpy(pkt + 2, &net_seq, sizeof(net_seq));
+    memcpy(pkt + 4, &ts, sizeof(ts));
+    memcpy(pkt + 8, &net_ssrc, sizeof(net_ssrc));
+    for (size_t i = 0; i < FAILCON_PAYLOAD_LEN; i++) {
+        pkt[12 + i] = (uint8_t)(0xa0 + i);
+    }
+}
+
+/* true if any three consecutive payload octets appear in the buffer */
+static bool failcon_has_payload(const uint8_t *buf, size_t len)
+{
+    for (size_t i = 0; i + 2 < len; i++) {
+        if (buf[i] == 0xa0 && buf[i + 1] == 0xa1 && buf[i + 2] == 0xa2) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool failcon_same_state(srtp_t receiver, uint32_t ssrc, uint64_t index,
+                               uint32_t roc)
+{
+    uint64_t now_index = 0;
+    uint32_t now_roc = 0;
+
+    if (srtp_stream_get_packet_index(receiver, ssrc, &now_index) ||
+        srtp_stream_get_roc(receiver, ssrc, &now_roc)) {
+        return false;
+    }
+
+    return now_index == index && now_roc == roc;
+}
+
+static srtp_err_status_t failcon_profile(srtp_profile_t profile, bool gcm)
+{
+    const uint32_t ssrc = 0xc0ffee11;
+    const size_t plain_len = 12 + FAILCON_PAYLOAD_LEN;
+    srtp_policy_t sp, rp;
+    srtp_t sender, receiver;
+    uint8_t plain[12 + FAILCON_PAYLOAD_LEN];
+    uint8_t srtp_pkt[FAILCON_BUF_LEN];
+    uint8_t result[FAILCON_BUF_LEN];
+    uint8_t input[FAILCON_BUF_LEN];
+    size_t srtp_len;
+    uint64_t index_before;
+    uint32_t roc_before;
+
+    CHECK_OK(srtp_policy_create(&sp));
+    CHECK_OK(srtp_policy_create(&rp));
+    CHECK_OK(srtp_policy_set_profile(sp, profile));
+    CHECK_OK(srtp_policy_set_profile(rp, profile));
+    CHECK_OK(srtp_policy_set_ssrc(sp, (srtp_ssrc_t){ ssrc_specific, ssrc }));
+    CHECK_OK(srtp_policy_set_ssrc(rp, (srtp_ssrc_t){ ssrc_specific, ssrc }));
+    if (gcm) {
+        CHECK_OK(policy_set_key(sp, test_key_gcm));
+        CHECK_OK(policy_set_key(rp, test_key_gcm));
+    } else {
+        CHECK_OK(policy_set_key(sp, test_key));
+        CHECK_OK(policy_set_key(rp, test_key));
+    }
+    CHECK_OK(srtp_create(&sender, sp));
+    CHECK_OK(srtp_create(&receiver, rp));
+
+    for (int inplace = 0; inplace < 2; inplace++) {
+        /* corrupted authentication tag / payload, on its own sequence number */
+        uint8_t forged[FAILCON_BUF_LEN];
+        uint16_t seq = (uint16_t)(1 + inplace);
+        size_t out_len;
+
+        failcon_fill_rtp(plain, ssrc, seq);
+        srtp_len = sizeof(srtp_pkt);
+        CHECK_OK(
+            srtp_protect(sender, plain, plain_len, srtp_pkt, &srtp_len, 0));
+
+        CHECK_OK(srtp_stream_get_packet_index(receiver, ssrc, &index_before));
+        CHECK_OK(srtp_stream_get_roc(receiver, ssrc, &roc_before));
+
+        memcpy(forged, srtp_pkt, srtp_len);
+        forged[srtp_len - 1] ^= 0xff;
+        forged[12] ^= 0xff;
+
+        out_len = sizeof(result);
+        memset(result, 0x5a, sizeof(result));
+        if (inplace) {
+            memcpy(input, forged, srtp_len);
+            CHECK_RETURN(
+                srtp_unprotect(receiver, input, srtp_len, input, &out_len),
+                srtp_err_status_auth_fail);
+            CHECK(out_len == 0);
+            CHECK(!failcon_has_payload(input, sizeof(input)));
+        } else {
+            memset(input, 0x33, sizeof(input));
+            memcpy(input, forged, srtp_len);
+            CHECK_RETURN(
+                srtp_unprotect(receiver, input, srtp_len, result, &out_len),
+                srtp_err_status_auth_fail);
+            CHECK(out_len == 0);
+            CHECK(!failcon_has_payload(result, sizeof(result)));
+            /* an out-of-place call must not touch the const input */
+            CHECK(memcmp(input, forged, srtp_len) == 0);
+        }
+        CHECK(failcon_same_state(receiver, ssrc, index_before, roc_before));
+
+        /*
+         * The rejected packet consumed no replay state, so the genuine packet
+         * with the same sequence number is still accepted and decrypts.
+         */
+        out_len = sizeof(result);
+        memset(result, 0x5a, sizeof(result));
+        if (inplace) {
+            memcpy(input, srtp_pkt, srtp_len);
+            CHECK_OK(srtp_unprotect(receiver, input, srtp_len, input,
+                                    &out_len));
+            CHECK(out_len == plain_len);
+            CHECK_BUFFER_EQUAL(input, plain, plain_len);
+        } else {
+            memcpy(input, srtp_pkt, srtp_len);
+            CHECK_OK(
+                srtp_unprotect(receiver, input, srtp_len, result, &out_len));
+            CHECK(out_len == plain_len);
+            CHECK_BUFFER_EQUAL(result, plain, plain_len);
+            CHECK(memcmp(input, srtp_pkt, srtp_len) == 0);
+        }
+
+        /* a following sequence number is also unaffected */
+        failcon_fill_rtp(plain, ssrc, (uint16_t)(seq + 2));
+        srtp_len = sizeof(srtp_pkt);
+        CHECK_OK(
+            srtp_protect(sender, plain, plain_len, srtp_pkt, &srtp_len, 0));
+
+        /* output buffer too small: nothing is written and no state moves */
+        CHECK_OK(srtp_stream_get_packet_index(receiver, ssrc, &index_before));
+        CHECK_OK(srtp_stream_get_roc(receiver, ssrc, &roc_before));
+        out_len = 8; /* far less than a full RTP packet */
+        {
+            uint8_t small[FAILCON_BUF_LEN];
+            memset(small, 0x7e, sizeof(small));
+            if (inplace) {
+                memcpy(small, srtp_pkt, srtp_len);
+                CHECK_RETURN(
+                    srtp_unprotect(receiver, small, srtp_len, small, &out_len),
+                    srtp_err_status_buffer_small);
+                CHECK(out_len == 0);
+                /* octets beyond the caller's capacity are untouched */
+                for (size_t i = srtp_len; i < sizeof(small); i++) {
+                    CHECK(small[i] == 0x7e);
+                }
+                CHECK(!failcon_has_payload(small, srtp_len));
+            } else {
+                memcpy(input, srtp_pkt, srtp_len);
+                CHECK_RETURN(
+                    srtp_unprotect(receiver, input, srtp_len, small, &out_len),
+                    srtp_err_status_buffer_small);
+                CHECK(out_len == 0);
+                for (size_t i = 0; i < sizeof(small); i++) {
+                    CHECK(small[i] == 0x7e);
+                }
+            }
+        }
+        CHECK(failcon_same_state(receiver, ssrc, index_before, roc_before));
+
+        /* the genuine packet is still accepted after the space failure */
+        out_len = sizeof(result);
+        memset(result, 0x5a, sizeof(result));
+        if (inplace) {
+            memcpy(input, srtp_pkt, srtp_len);
+            CHECK_OK(srtp_unprotect(receiver, input, srtp_len, input,
+                                    &out_len));
+            CHECK(out_len == plain_len);
+            CHECK_BUFFER_EQUAL(input, plain, plain_len);
+        } else {
+            memcpy(input, srtp_pkt, srtp_len);
+            CHECK_OK(
+                srtp_unprotect(receiver, input, srtp_len, result, &out_len));
+            CHECK(out_len == plain_len);
+            CHECK_BUFFER_EQUAL(result, plain, plain_len);
+        }
+    }
+
+    /*
+     * A truncated packet that is rejected before any tag check must also
+     * report no output and leave the state alone.
+     */
+    failcon_fill_rtp(plain, ssrc, 5);
+    srtp_len = sizeof(srtp_pkt);
+    CHECK_OK(srtp_protect(sender, plain, plain_len, srtp_pkt, &srtp_len, 0));
+    CHECK_OK(srtp_stream_get_packet_index(receiver, ssrc, &index_before));
+    CHECK_OK(srtp_stream_get_roc(receiver, ssrc, &roc_before));
+    {
+        size_t short_len = 10; /* shorter than the RTP header */
+        size_t out_len = sizeof(result);
+
+        memset(result, 0x5a, sizeof(result));
+        memcpy(input, srtp_pkt, short_len);
+        CHECK_RETURN(srtp_unprotect(receiver, input, short_len, result,
+                                    &out_len),
+                     srtp_err_status_bad_param);
+        CHECK(out_len == 0);
+        CHECK(!failcon_has_payload(result, sizeof(result)));
+        CHECK(failcon_same_state(receiver, ssrc, index_before, roc_before));
+    }
+
+    CHECK_OK(srtp_dealloc(sender));
+    CHECK_OK(srtp_dealloc(receiver));
+    srtp_policy_destroy(sp);
+    srtp_policy_destroy(rp);
+
+    return srtp_err_status_ok;
+}
+
+static srtp_err_status_t failcon_rtcp_profile(srtp_profile_t profile, bool gcm)
+{
+    const uint32_t ssrc = 0xc0ffee22;
+    const size_t rtcp_len = 8 + FAILCON_PAYLOAD_LEN;
+    srtp_policy_t sp, rp;
+    srtp_t sender, receiver;
+    uint8_t rtcp[FAILCON_BUF_LEN];
+    uint8_t srtcp[FAILCON_BUF_LEN];
+    uint8_t result[FAILCON_BUF_LEN];
+    uint8_t input[FAILCON_BUF_LEN];
+    size_t srtcp_len;
+    uint32_t index_before;
+    uint32_t index_now;
+
+    CHECK_OK(srtp_policy_create(&sp));
+    CHECK_OK(srtp_policy_create(&rp));
+    CHECK_OK(srtp_policy_set_profile(sp, profile));
+    CHECK_OK(srtp_policy_set_profile(rp, profile));
+    CHECK_OK(srtp_policy_set_sec_serv(sp, sec_serv_conf_and_auth,
+                                      sec_serv_conf_and_auth));
+    CHECK_OK(srtp_policy_set_sec_serv(rp, sec_serv_conf_and_auth,
+                                      sec_serv_conf_and_auth));
+    CHECK_OK(srtp_policy_set_ssrc(sp, (srtp_ssrc_t){ ssrc_specific, ssrc }));
+    CHECK_OK(srtp_policy_set_ssrc(rp, (srtp_ssrc_t){ ssrc_specific, ssrc }));
+    if (gcm) {
+        CHECK_OK(policy_set_key(sp, test_key_gcm));
+        CHECK_OK(policy_set_key(rp, test_key_gcm));
+    } else {
+        CHECK_OK(policy_set_key(sp, test_key));
+        CHECK_OK(policy_set_key(rp, test_key));
+    }
+    CHECK_OK(srtp_create(&sender, sp));
+    CHECK_OK(srtp_create(&receiver, rp));
+
+    memset(rtcp, 0, sizeof(rtcp));
+    rtcp[0] = 0x80; /* V=2 */
+    rtcp[1] = 0xc8; /* SR */
+    rtcp[2] = 0;
+    rtcp[3] = (uint8_t)((rtcp_len / 4) - 1);
+    {
+        uint32_t net_ssrc = htonl(ssrc);
+        memcpy(rtcp + 4, &net_ssrc, sizeof(net_ssrc));
+    }
+    for (size_t i = 0; i < FAILCON_PAYLOAD_LEN; i++) {
+        rtcp[8 + i] = (uint8_t)(0xa0 + i);
+    }
+
+    for (int inplace = 0; inplace < 2; inplace++) {
+        uint8_t forged[FAILCON_BUF_LEN];
+        size_t out_len;
+
+        /*
+         * Each SRTCP packet carries the next index; protect a fresh one for
+         * every iteration so the replay database does not interfere.
+         */
+        srtcp_len = sizeof(srtcp);
+        CHECK_OK(
+            srtp_protect_rtcp(sender, rtcp, rtcp_len, srtcp, &srtcp_len, 0));
+        CHECK_OK(srtp_stream_get_srtcp_index(receiver, ssrc, &index_before));
+
+        memcpy(forged, srtcp, srtcp_len);
+        forged[srtcp_len - 1] ^= 0xff;
+        forged[8] ^= 0xff;
+
+        out_len = sizeof(result);
+        memset(result, 0x5a, sizeof(result));
+        if (inplace) {
+            memcpy(input, forged, srtcp_len);
+            CHECK_RETURN(
+                srtp_unprotect_rtcp(receiver, input, srtcp_len, input,
+                                    &out_len),
+                srtp_err_status_auth_fail);
+            CHECK(out_len == 0);
+            CHECK(!failcon_has_payload(input, sizeof(input)));
+        } else {
+            memset(input, 0x33, sizeof(input));
+            memcpy(input, forged, srtcp_len);
+            CHECK_RETURN(
+                srtp_unprotect_rtcp(receiver, input, srtcp_len, result,
+                                    &out_len),
+                srtp_err_status_auth_fail);
+            CHECK(out_len == 0);
+            CHECK(!failcon_has_payload(result, sizeof(result)));
+            CHECK(memcmp(input, forged, srtcp_len) == 0);
+        }
+        CHECK_OK(srtp_stream_get_srtcp_index(receiver, ssrc, &index_now));
+        CHECK(index_now == index_before);
+
+        /* the genuine packet is still accepted after the rejection */
+        out_len = sizeof(result);
+        memset(result, 0x5a, sizeof(result));
+        if (inplace) {
+            memcpy(input, srtcp, srtcp_len);
+            CHECK_OK(srtp_unprotect_rtcp(receiver, input, srtcp_len, input,
+                                         &out_len));
+            CHECK(out_len == rtcp_len);
+            CHECK_BUFFER_EQUAL(input, rtcp, rtcp_len);
+        } else {
+            memcpy(input, srtcp, srtcp_len);
+            CHECK_OK(srtp_unprotect_rtcp(receiver, input, srtcp_len, result,
+                                         &out_len));
+            CHECK(out_len == rtcp_len);
+            CHECK_BUFFER_EQUAL(result, rtcp, rtcp_len);
+            CHECK(memcmp(input, srtcp, srtcp_len) == 0);
+        }
+    }
+
+    CHECK_OK(srtp_dealloc(sender));
+    CHECK_OK(srtp_dealloc(receiver));
+    srtp_policy_destroy(sp);
+    srtp_policy_destroy(rp);
+
+    return srtp_err_status_ok;
+}
+
+srtp_err_status_t srtp_test_unprotect_failure_contract(void)
+{
+    CHECK_OK(failcon_profile(srtp_profile_aes128_cm_sha1_80, false));
+    CHECK_OK(failcon_rtcp_profile(srtp_profile_aes128_cm_sha1_80, false));
+#ifdef HAVE_GCM
+    CHECK_OK(failcon_profile(srtp_profile_aead_aes_128_gcm, true));
+    CHECK_OK(failcon_rtcp_profile(srtp_profile_aead_aes_128_gcm, true));
+#endif
+
+    return srtp_err_status_ok;
+}
+
+/*
  * Test vectors taken from RFC 6904, Appendix A
  */
 srtp_err_status_t srtp_validate_encrypted_extensions_headers(void)
@@ -5018,6 +5392,7 @@ srtp_err_status_t srtp_test_update(void)
     uint32_t ssrc = 0x12121212;
     size_t msg_len_octets = 32;
     size_t protected_msg_len_octets;
+    size_t protected_len_for_retry;
     uint8_t *msg;
     srtp_t srtp_snd, srtp_recv;
     srtp_policy_t policy;
@@ -5133,9 +5508,16 @@ srtp_err_status_t srtp_test_update(void)
 
     /* verify that receive ctx will fail to unprotect as it still uses test_key
      */
-    status = call_srtp_unprotect(srtp_recv, msg, &protected_msg_len_octets);
-    if (status == srtp_err_status_ok) {
-        return srtp_err_status_fail;
+    {
+        /* a failed unprotect does not report a usable length */
+        protected_len_for_retry = protected_msg_len_octets;
+
+        status =
+            call_srtp_unprotect(srtp_recv, msg, &protected_msg_len_octets);
+        if (status == srtp_err_status_ok) {
+            return srtp_err_status_fail;
+        }
+        protected_msg_len_octets = protected_len_for_retry;
     }
 
     /* create a new receive ctx with test_alt_key but since it is new it will
@@ -5157,6 +5539,7 @@ srtp_err_status_t srtp_test_update(void)
         if (status == srtp_err_status_ok) {
             return srtp_err_status_fail;
         }
+        protected_msg_len_octets = protected_len_for_retry;
 
         status = srtp_dealloc(srtp_recv_roc_0);
         if (status) {
