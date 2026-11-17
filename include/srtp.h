@@ -776,9 +776,12 @@ srtp_err_status_t srtp_protect(srtp_t ctx,
  * the Secure RTP protection of the SRTP packet pointed to by srtp
  * (which has length srtp_len), using the SRTP context ctx.  If
  * srtp_err_status_ok is returned, then rtp points to the resulting
- * RTP packet and *rtp_len is the number of octets in that packet;
- * otherwise, no assumptions should be made about the value of either
- * data elements.
+ * RTP packet and *rtp_len is the number of octets in that packet.
+ * On any failure return *rtp_len is set to zero, the rtp buffer holds no
+ * unauthenticated packet content, and the replay state of the stream is
+ * left unchanged, so a failed packet can never be mistaken for a
+ * delivered one; this holds both for in-place operation (rtp == srtp)
+ * and for a separate output buffer.
  *
  * The sequence numbers of the RTP packets presented to this function
  * need not be consecutive, but they @b must be out of order by less
@@ -798,10 +801,10 @@ srtp_err_status_t srtp_protect(srtp_t ctx,
  * contain the complete RTP packet. The value of rtp can be the same as srtp
  * to support in-place io.
  *
- * @param srtp_len is a pointer to the length of the rtp buffer before the
+ * @param rtp_len is a pointer to the length of the rtp buffer before the
  * function call, and of the complete RTP packet after the call, if
- * srtp_err_status_ok was returned. Otherwise, the value of the data to which
- * it points is undefined.
+ * srtp_err_status_ok was returned. On any failure return the value of the
+ * data to which it points is set to zero.
  *
  * @return
  *    - srtp_err_status_ok          if the RTP packet is valid.

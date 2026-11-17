@@ -2369,6 +2369,10 @@ static srtp_err_status_t srtp_protect_aead(srtp_ctx_t *ctx,
  * encrypted and authenticated.  Note, the auth tag is at the end
  * of the packet stream and is automatically checked by GCM
  * when decrypting the payload.
+ *
+ * The caller must have already set *rtp_len to zero; this function only
+ * stores a non-zero length once the packet has been authenticated, so
+ * that a failure return can never be mistaken for a delivered packet.
  */
 static srtp_err_status_t srtp_unprotect_aead(srtp_ctx_t *ctx,
                                              srtp_stream_ctx_t *stream,
@@ -2377,6 +2381,7 @@ static srtp_err_status_t srtp_unprotect_aead(srtp_ctx_t *ctx,
                                              const uint8_t *srtp,
                                              size_t srtp_len,
                                              uint8_t *rtp,
+                                             size_t rtp_out_capacity,
                                              size_t *rtp_len,
                                              srtp_session_keys_t *session_keys,
                                              bool advance_packet_index)
@@ -2514,7 +2519,7 @@ static srtp_err_status_t srtp_unprotect_aead(srtp_ctx_t *ctx,
     }
 
     /* check output length */
-    if (*rtp_len < srtp_len - stream->mki_size - tag_len - rcc_extra) {
+    if (rtp_out_capacity < srtp_len - stream->mki_size - tag_len - rcc_extra) {
         return srtp_err_status_buffer_small;
     }
 
@@ -2560,13 +2565,20 @@ static srtp_err_status_t srtp_unprotect_aead(srtp_ctx_t *ctx,
 
     /* Decrypt the ciphertext.  This also checks the auth tag based
      * on the AAD we just specified above */
-    size_t outlen = *rtp_len - enc_start;
+    size_t outlen = rtp_out_capacity - enc_start;
     status = srtp_cipher_decrypt(session_keys->rtp_cipher, srtp + enc_start,
                                  enc_octet_len, rtp + enc_start, &outlen);
-    enc_octet_len = outlen;
     if (status) {
+        /*
+         * A cipher backend may write the plaintext into the output buffer
+         * before the authentication tag has been verified.  Do not leave
+         * that unauthenticated plaintext where the caller could mistake
+         * it for a valid packet; the returned length stays zero.
+         */
+        octet_string_set_to_zero(rtp, enc_start + enc_octet_len - tag_len);
         return status;
     }
+    enc_octet_len = outlen;
 
     if (hdr->x == 1 && session_keys->rtp_xtn_hdr_cipher) {
         /*
@@ -3034,6 +3046,16 @@ srtp_err_status_t srtp_unprotect(srtp_t ctx,
 
     debug_print0(mod_srtp, "function srtp_unprotect");
 
+    /*
+     * Nothing is delivered to the caller until the packet has been
+     * authenticated.  Report a zero length until then, so that any
+     * failure return - a bad tag, a short packet, an undersized output
+     * buffer - is consistently reported as "no packet", whether the
+     * packet is processed in place or into a separate output buffer.
+     */
+    const size_t rtp_out_capacity = *rtp_len;
+    *rtp_len = 0;
+
     /* Verify RTP header */
     status = srtp_validate_rtp_header(srtp, srtp_len);
     if (status) {
@@ -3146,8 +3168,9 @@ srtp_err_status_t srtp_unprotect(srtp_t ctx,
      */
     if (session_keys->rtp_cipher->algorithm == SRTP_AES_GCM_128 ||
         session_keys->rtp_cipher->algorithm == SRTP_AES_GCM_256) {
-        return srtp_unprotect_aead(ctx, stream, delta, est, srtp, srtp_len, rtp,
-                                   rtp_len, session_keys, advance_packet_index);
+        return srtp_unprotect_aead(ctx, stream, delta, est, srtp, srtp_len,
+                                   rtp, rtp_out_capacity, rtp_len,
+                                   session_keys, advance_packet_index);
     }
 
     /* get tag length from stream */
@@ -3249,13 +3272,8 @@ srtp_err_status_t srtp_unprotect(srtp_t ctx,
     enc_octet_len = srtp_len - enc_start - stream->mki_size - rcc_tag_len;
 
     /* check output length */
-    if (*rtp_len < srtp_len - stream->mki_size - rcc_tag_len) {
+    if (rtp_out_capacity < srtp_len - stream->mki_size - rcc_tag_len) {
         return srtp_err_status_buffer_small;
-    }
-
-    /* if not-inplace then need to copy full rtp header */
-    if (srtp != rtp) {
-        memcpy(rtp, srtp, enc_start);
     }
 
     /*
@@ -3328,6 +3346,16 @@ srtp_err_status_t srtp_unprotect(srtp_t ctx,
         } else if (!srtp_octet_string_equal(tmp_tag, auth_tag, tag_len)) {
             return srtp_err_status_auth_fail;
         }
+    }
+
+    /*
+     * The packet is authenticated at this point.  Only now copy the
+     * header into a separate output buffer, so that an authentication
+     * failure never leaves unauthenticated packet content behind for
+     * the caller.
+     */
+    if (srtp != rtp) {
+        memcpy(rtp, srtp, enc_start);
     }
 
     /*

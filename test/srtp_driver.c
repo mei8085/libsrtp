@@ -5131,8 +5131,16 @@ srtp_err_status_t srtp_test_update(void)
         return srtp_err_status_fail;
     }
 
+    /*
+     * The same protected message is unprotected several times below.  A
+     * failed unprotect reports a zero output length, so the length must
+     * be restored before each attempt.
+     */
+    const size_t srtp_msg_len_octets = protected_msg_len_octets;
+
     /* verify that receive ctx will fail to unprotect as it still uses test_key
      */
+    protected_msg_len_octets = srtp_msg_len_octets;
     status = call_srtp_unprotect(srtp_recv, msg, &protected_msg_len_octets);
     if (status == srtp_err_status_ok) {
         return srtp_err_status_fail;
@@ -5152,6 +5160,7 @@ srtp_err_status_t srtp_test_update(void)
             return status;
         }
 
+        protected_msg_len_octets = srtp_msg_len_octets;
         status = call_srtp_unprotect(srtp_recv_roc_0, msg,
                                      &protected_msg_len_octets);
         if (status == srtp_err_status_ok) {
@@ -5175,6 +5184,7 @@ srtp_err_status_t srtp_test_update(void)
 
     /* verify that can still unprotect, therfore key is updated and ROC value is
      * preserved */
+    protected_msg_len_octets = srtp_msg_len_octets;
     status = call_srtp_unprotect(srtp_recv, msg, &protected_msg_len_octets);
     if (status) {
         return status;
