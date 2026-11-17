@@ -479,6 +479,26 @@ if(LIBSRTP_TEST_APPS)
     target_link_libraries(test_srtp srtp3)
     add_test(test_srtp test_srtp)
 
+    add_executable(test_hdr_xtnd test/test_hdr_xtnd.c)
+    target_set_warnings(
+            TARGET
+            test_hdr_xtnd
+            ENABLE
+            ${ENABLE_WARNINGS}
+            AS_ERRORS
+            ${ENABLE_WARNINGS_AS_ERRORS})
+    if(ENABLE_OPENSSL)
+      target_include_directories(test_hdr_xtnd PRIVATE ${OPENSSL_INCLUDE_DIR})
+    elseif(ENABLE_WOLFSSL)
+      target_include_directories(test_hdr_xtnd PRIVATE ${WOLFSSL_INCLUDE_DIR})
+    elseif(ENABLE_MBEDTLS)
+      target_include_directories(test_hdr_xtnd PRIVATE ${MBEDTLS_INCLUDE_DIRS})
+    elseif(ENABLE_NSS)
+      target_include_directories(test_hdr_xtnd PRIVATE ${NSS_INCLUDE_DIRS})
+    endif()
+    target_link_libraries(test_hdr_xtnd srtp3)
+    add_test(test_hdr_xtnd test_hdr_xtnd)
+
     add_executable(test_srtp_policy test/test_srtp_policy.c test/util.c)
     target_set_warnings(
             TARGET

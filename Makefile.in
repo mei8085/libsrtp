@@ -47,6 +47,7 @@ runtest: test
 	$(FIND_LIBRARIES) crypto/test/cipher_driver$(EXE) -v >/dev/null
 	$(FIND_LIBRARIES) crypto/test/kernel_driver$(EXE) -v >/dev/null
 	$(FIND_LIBRARIES) test/test_srtp$(EXE) >/dev/null
+	$(FIND_LIBRARIES) test/test_hdr_xtnd$(EXE) >/dev/null
 	$(FIND_LIBRARIES) test/test_srtp_policy$(EXE) >/dev/null
 	$(FIND_LIBRARIES) test/rcc_test$(EXE) >/dev/null
 	$(FIND_LIBRARIES) test/rdbx_driver$(EXE) -v >/dev/null
@@ -191,7 +192,8 @@ crypto_testapp = $(AES_CALC) crypto/test/cipher_driver$(EXE) \
 
 testapp = $(crypto_testapp) test/srtp_driver$(EXE) test/replay_driver$(EXE) \
 	  test/roc_driver$(EXE) test/rdbx_driver$(EXE) test/rtpw$(EXE) \
-	  test/test_srtp$(EXE) test/test_srtp_policy$(EXE) test/rcc_test$(EXE)
+	  test/test_srtp$(EXE) test/test_hdr_xtnd$(EXE) \
+	  test/test_srtp_policy$(EXE) test/rcc_test$(EXE)
 
 ifeq (1, $(HAVE_PCAP))
 testapp += test/rtp_decoder$(EXE)
@@ -213,6 +215,9 @@ crypto/test/aes_calc$(EXE): crypto/test/aes_calc.c test/util.c
 	$(COMPILE) -I$(srcdir)/test $(LDFLAGS) -o $@ $^ $(LIBS) $(SRTPLIB)
 
 test/test_srtp$(EXE): test/test_srtp.c
+	$(COMPILE) -I$(srcdir)/test $(LDFLAGS) -o $@ $^ $(LIBS) $(SRTPLIB)
+
+test/test_hdr_xtnd$(EXE): test/test_hdr_xtnd.c
 	$(COMPILE) -I$(srcdir)/test $(LDFLAGS) -o $@ $^ $(LIBS) $(SRTPLIB)
 
 test/test_srtp_policy$(EXE): test/test_srtp_policy.c  test/util.c
