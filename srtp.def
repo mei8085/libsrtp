@@ -42,6 +42,7 @@ srtp_set_user_data
 srtp_stream_get_roc
 srtp_stream_get_packet_index
 srtp_stream_get_srtcp_index
+srtp_stream_get_key_usage
 srtp_get_user_data
 srtp_install_event_handler
 srtp_get_version_string

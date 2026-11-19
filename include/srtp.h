@@ -1244,6 +1244,75 @@ typedef void(srtp_event_handler_func_t)(srtp_event_data_t *data);
 srtp_err_status_t srtp_install_event_handler(srtp_event_handler_func_t func);
 
 /**
+ * @brief srtp_key_usage_protocol_t selects which of the two session
+ * keys derived from a master key is being observed.
+ *
+ * The SRTP and SRTCP session keys are derived independently and each has
+ * its own packet index space (48-bit extended RTP index and 31-bit SRTCP
+ * index), so key usage is accumulated separately for each protocol.
+ */
+typedef enum {
+    srtp_key_usage_rtp = 0, /**< SRTP (RTP) traffic                    */
+    srtp_key_usage_rtcp = 1 /**< SRTCP (RTCP) traffic                  */
+} srtp_key_usage_protocol_t;
+
+/**
+ * @brief srtp_key_usage_state_t is the observable lifecycle state of a
+ * derived session key for one protocol.
+ *
+ * The state is derived from the packets that were actually protected or
+ * successfully unprotected.  Replayed packets and packets that fail
+ * authentication do not change it, and re-deriving the master key (for
+ * example through srtp_update()) resets it to srtp_key_usage_normal.
+ */
+typedef enum {
+    srtp_key_usage_normal = 0,      /**< full budget available                    */
+    srtp_key_usage_soft_limit = 1,  /**< soft threshold reached; re-key soon      */
+    srtp_key_usage_expired = 2      /**< hard limit reached; no further packets   */
+                                    /**< can be processed until the key is        */
+                                    /**< re-derived                               */
+} srtp_key_usage_state_t;
+
+/**
+ * @brief srtp_key_usage_t reports the usage boundary of a derived
+ * session key for one protocol.
+ */
+typedef struct srtp_key_usage_t {
+    srtp_key_usage_protocol_t protocol; /**< protocol this report describes   */
+    srtp_key_usage_state_t state;       /**< current lifecycle state           */
+    uint64_t packets_remaining;         /**< packets still available under the */
+                                        /**< current derived key                */
+} srtp_key_usage_t;
+
+/**
+ * @brief Reads the current key usage boundary of a stream.
+ *
+ * The SRTP and SRTCP counters are read independently; pass the desired
+ * protocol through the @p protocol argument.  The reported state mirrors
+ * the events delivered to the event handler (soft limit, hard limit) and
+ * the packet index ceiling: once a key is expired or the packet index
+ * cannot advance safely, protect/unprotect calls fail with
+ * srtp_err_status_key_expired until the master key is re-derived.
+ *
+ * When Master Key Identification (MKI) is in use, each master key keeps
+ * its own independent counters; this function reports the counters of
+ * the first master key (index 0).
+ *
+ * @param session is the SRTP session.
+ * @param ssrc is the SSRC of the stream, in host byte order.
+ * @param protocol selects the SRTP or SRTCP counter.
+ * @param[out] usage receives the current usage state and remaining budget.
+ *
+ * @return srtp_err_status_ok on success.
+ * @return srtp_err_status_bad_param if an argument is invalid or no
+ *         stream exists for @p ssrc.
+ */
+srtp_err_status_t srtp_stream_get_key_usage(srtp_t session,
+                                            uint32_t ssrc,
+                                            srtp_key_usage_protocol_t protocol,
+                                            srtp_key_usage_t *usage);
+
+/**
  * @brief Returns the version string of the library.
  *
  */

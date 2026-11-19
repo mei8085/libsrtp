@@ -1262,8 +1262,8 @@ srtp_err_status_t srtp_stream_init_keys(srtp_session_keys_t *session_keys,
      * be part of srtp_policy_t.
      */
 
-    /* initialize key limit to maximum value */
-    srtp_key_limit_set(session_keys->limit, 0xffffffffffffLL);
+    /* initialize RTP and SRTCP usage counters to the full packet budget */
+    srtp_key_limit_init(session_keys->limit);
 
     if (mki_size != 0) {
         if (master_key->mki_id_len == 0 || master_key->mki_id_len != mki_size) {
@@ -1643,7 +1643,7 @@ srtp_err_status_t srtp_stream_init_all_master_keys(srtp_stream_ctx_t *srtp,
         }
 
         session_keys = &srtp->session_keys[0];
-        srtp_key_limit_set(session_keys->limit, 0xffffffffffffLL);
+        srtp_key_limit_init(session_keys->limit);
 
         status = srtp_cipher_init(session_keys->rtp_cipher, NULL);
         if (status) {
@@ -1744,8 +1744,6 @@ static srtp_err_status_t srtp_stream_init(srtp_stream_ctx_t *srtp,
     srtp->rcc_mode = p->rcc_mode;
     srtp->roc_tx_rate = (p->roc_tx_rate != 0) ? p->roc_tx_rate : 1;
 
-    /* DAM - no RTCP key limit at present */
-
     /* initialize keys */
     err = srtp_stream_init_all_master_keys(srtp, p);
     if (err) {
@@ -1811,6 +1809,56 @@ srtp_err_status_t srtp_install_event_handler(srtp_event_handler_func_t func)
     /* set global event handling function */
     srtp_event_handler = func;
     return srtp_err_status_ok;
+}
+
+/*
+ * srtp_account_key_usage() accounts for one genuine packet of the given
+ * protocol against the derived session key's usage budget and reports the
+ * resulting soft/hard limit event.
+ *
+ * It must be called only for packets that are actually sent or that have
+ * passed replay and authentication checks: replayed packets and packets
+ * failing authentication return before reaching this helper, so they
+ * never consume budget.  The SRTP and SRTCP budgets are accumulated
+ * independently even though they originate from the same master key.
+ */
+static srtp_err_status_t srtp_account_key_usage(
+    srtp_ctx_t *ctx,
+    srtp_stream_ctx_t *stream,
+    srtp_session_keys_t *session_keys,
+    srtp_key_protocol_t protocol)
+{
+    switch (srtp_key_limit_update(session_keys->limit, protocol)) {
+    case srtp_key_event_normal:
+        return srtp_err_status_ok;
+    case srtp_key_event_soft_limit:
+        srtp_handle_event(ctx, stream, event_key_soft_limit);
+        return srtp_err_status_ok;
+    case srtp_key_event_hard_limit:
+    default:
+        srtp_handle_event(ctx, stream, event_key_hard_limit);
+        return srtp_err_status_key_expired;
+    }
+}
+
+/*
+ * srtp_check_packet_index_ceiling() reports the packet index limit event
+ * when a sender has reached the last index that the protocol can encode,
+ * i.e. the point at which a further packet would wrap around the ROC or
+ * the SRTCP index.  Such a packet cannot be sent safely without first
+ * re-keying, so the caller must refuse it.
+ */
+static srtp_err_status_t srtp_check_packet_index_ceiling(
+    srtp_ctx_t *ctx,
+    srtp_stream_ctx_t *stream,
+    uint64_t next_index,
+    uint64_t max_index)
+{
+    if (next_index <= max_index) {
+        return srtp_err_status_ok;
+    }
+    srtp_handle_event(ctx, stream, event_packet_index_limit);
+    return srtp_err_status_key_expired;
 }
 
 /*
@@ -2175,23 +2223,6 @@ static srtp_err_status_t srtp_protect_aead(srtp_ctx_t *ctx,
 
     debug_print0(mod_srtp, "function srtp_protect_aead");
 
-    /*
-     * update the key usage limit, and check it to make sure that we
-     * didn't just hit either the soft limit or the hard limit, and call
-     * the event handler if we hit either.
-     */
-    switch (srtp_key_limit_update(session_keys->limit)) {
-    case srtp_key_event_normal:
-        break;
-    case srtp_key_event_hard_limit:
-        srtp_handle_event(ctx, stream, event_key_hard_limit);
-        return srtp_err_status_key_expired;
-    case srtp_key_event_soft_limit:
-    default:
-        srtp_handle_event(ctx, stream, event_key_soft_limit);
-        break;
-    }
-
     /* get tag length from stream */
     tag_len = srtp_auth_get_tag_length(session_keys->rtp_auth);
 
@@ -2248,6 +2279,8 @@ static srtp_err_status_t srtp_protect_aead(srtp_ctx_t *ctx,
         memcpy(srtp, rtp, enc_start);
     }
 
+    bool repeat_packet = false;
+    bool advance_packet_index = false;
     /*
      * estimate the packet index using the start of the replay window
      * and the sequence number from the header
@@ -2259,17 +2292,48 @@ static srtp_err_status_t srtp_protect_aead(srtp_ctx_t *ctx,
     }
 
     if (status == srtp_err_status_pkt_idx_adv) {
-        srtp_rdbx_set_roc_seq(&stream->rtp_rdbx, (uint32_t)(est >> 16),
-                              (uint16_t)(est & 0xFFFF));
-        stream->pending_roc = 0;
-        srtp_rdbx_add_index(&stream->rtp_rdbx, 0);
+        advance_packet_index = true;
     } else {
         status = srtp_rdbx_check(&stream->rtp_rdbx, delta);
         if (status) {
             if (status != srtp_err_status_replay_fail ||
                 !stream->allow_repeat_tx)
                 return status; /* we've been asked to reuse an index */
+            /*
+             * A repeated transmission reuses an existing index, so it
+             * must not consume any additional key usage budget.
+             */
+            repeat_packet = true;
         }
+    }
+
+    if (!repeat_packet) {
+        /*
+         * The packet carries a new index.  Refuse to send once the
+         * 48-bit index is about to wrap, since another packet under the
+         * same derived key would reuse an IV.
+         */
+        status = srtp_check_packet_index_ceiling(ctx, stream, (uint64_t)est,
+                                                 SRTP_PACKET_INDEX_MAX);
+        if (status) {
+            return status;
+        }
+
+        /* account the genuine new index against the SRTP usage budget */
+        status = srtp_account_key_usage(ctx, stream, session_keys,
+                                        srtp_key_protocol_rtp);
+        if (status) {
+            return status;
+        }
+    }
+
+    /* the packet is accepted: only now advance the replay database */
+    if (advance_packet_index) {
+        srtp_rdbx_set_roc_seq(&stream->rtp_rdbx, (uint32_t)(est >> 16),
+                              (uint16_t)(est & 0xFFFF));
+        stream->pending_roc = 0;
+        srtp_rdbx_add_index(&stream->rtp_rdbx, 0);
+    } else {
         srtp_rdbx_add_index(&stream->rtp_rdbx, delta);
         stream->pending_roc = 0;
     }
@@ -2523,24 +2587,6 @@ static srtp_err_status_t srtp_unprotect_aead(srtp_ctx_t *ctx,
         memcpy(rtp, srtp, enc_start);
     }
 
-    /*
-     * update the key usage limit, and check it to make sure that we
-     * didn't just hit either the soft limit or the hard limit, and call
-     * the event handler if we hit either.
-     */
-    switch (srtp_key_limit_update(session_keys->limit)) {
-    case srtp_key_event_normal:
-        break;
-    case srtp_key_event_soft_limit:
-        srtp_handle_event(ctx, stream, event_key_soft_limit);
-        break;
-    case srtp_key_event_hard_limit:
-        srtp_handle_event(ctx, stream, event_key_hard_limit);
-        return srtp_err_status_key_expired;
-    default:
-        break;
-    }
-
     if (cryptex_inuse) {
         status = srtp_cryptex_unprotect(cryptex_inplace, hdr, rtp,
                                         session_keys->rtp_cipher);
@@ -2622,6 +2668,19 @@ static srtp_err_status_t srtp_unprotect_aead(srtp_ctx_t *ctx,
 
         /* set stream (the pointer used in this function) */
         stream = new_stream;
+    }
+
+    /*
+     * The GCM tag verified and the index is genuine, so account it
+     * against the SRTP key usage budget.  Replayed packets and failed
+     * tags returned earlier and never reach this point.  Doing this
+     * before touching the replay database means a refused packet leaves
+     * no state behind.
+     */
+    status = srtp_account_key_usage(ctx, stream, session_keys,
+                                    srtp_key_protocol_rtp);
+    if (status) {
+        return status;
     }
 
     /*
@@ -2751,24 +2810,6 @@ srtp_err_status_t srtp_protect(srtp_t ctx,
                                  session_keys);
     }
 
-    /*
-     * update the key usage limit, and check it to make sure that we
-     * didn't just hit either the soft limit or the hard limit, and call
-     * the event handler if we hit either.
-     */
-    switch (srtp_key_limit_update(session_keys->limit)) {
-    case srtp_key_event_normal:
-        break;
-    case srtp_key_event_soft_limit:
-        srtp_handle_event(ctx, stream, event_key_soft_limit);
-        break;
-    case srtp_key_event_hard_limit:
-        srtp_handle_event(ctx, stream, event_key_hard_limit);
-        return srtp_err_status_key_expired;
-    default:
-        break;
-    }
-
     /* get tag length from stream */
     tag_len = srtp_auth_get_tag_length(session_keys->rtp_auth);
 
@@ -2837,6 +2878,8 @@ srtp_err_status_t srtp_protect(srtp_t ctx,
      * estimate the packet index using the start of the replay window
      * and the sequence number from the header
      */
+    bool repeat_packet = false;
+    bool advance_packet_index = false;
     status = srtp_get_est_pkt_index(hdr, stream, &est, &delta);
 
     if (status && (status != srtp_err_status_pkt_idx_adv)) {
@@ -2844,17 +2887,48 @@ srtp_err_status_t srtp_protect(srtp_t ctx,
     }
 
     if (status == srtp_err_status_pkt_idx_adv) {
-        srtp_rdbx_set_roc_seq(&stream->rtp_rdbx, (uint32_t)(est >> 16),
-                              (uint16_t)(est & 0xFFFF));
-        stream->pending_roc = 0;
-        srtp_rdbx_add_index(&stream->rtp_rdbx, 0);
+        advance_packet_index = true;
     } else {
         status = srtp_rdbx_check(&stream->rtp_rdbx, delta);
         if (status) {
             if (status != srtp_err_status_replay_fail ||
                 !stream->allow_repeat_tx)
                 return status; /* we've been asked to reuse an index */
+            /*
+             * A repeated transmission reuses an existing index, so it
+             * must not consume any additional key usage budget.
+             */
+            repeat_packet = true;
         }
+    }
+
+    if (!repeat_packet) {
+        /*
+         * The packet carries a new index.  Refuse to send once the
+         * 48-bit index is about to wrap, since another packet under the
+         * same derived key would reuse an IV.
+         */
+        status = srtp_check_packet_index_ceiling(ctx, stream, (uint64_t)est,
+                                                 SRTP_PACKET_INDEX_MAX);
+        if (status) {
+            return status;
+        }
+
+        /* account the genuine new index against the SRTP usage budget */
+        status = srtp_account_key_usage(ctx, stream, session_keys,
+                                        srtp_key_protocol_rtp);
+        if (status) {
+            return status;
+        }
+    }
+
+    /* the packet is accepted: only now advance the replay database */
+    if (advance_packet_index) {
+        srtp_rdbx_set_roc_seq(&stream->rtp_rdbx, (uint32_t)(est >> 16),
+                              (uint16_t)(est & 0xFFFF));
+        stream->pending_roc = 0;
+        srtp_rdbx_add_index(&stream->rtp_rdbx, 0);
+    } else {
         srtp_rdbx_add_index(&stream->rtp_rdbx, delta);
         stream->pending_roc = 0;
     }
@@ -3331,21 +3405,15 @@ srtp_err_status_t srtp_unprotect(srtp_t ctx,
     }
 
     /*
-     * update the key usage limit, and check it to make sure that we
-     * didn't just hit either the soft limit or the hard limit, and call
-     * the event handler if we hit either.
+     * The authentication tag matched (or authentication is not in use),
+     * so the packet is genuine: account it against the SRTP key usage
+     * budget.  Replayed packets and failed tags returned earlier and thus
+     * never consume budget.
      */
-    switch (srtp_key_limit_update(session_keys->limit)) {
-    case srtp_key_event_normal:
-        break;
-    case srtp_key_event_soft_limit:
-        srtp_handle_event(ctx, stream, event_key_soft_limit);
-        break;
-    case srtp_key_event_hard_limit:
-        srtp_handle_event(ctx, stream, event_key_hard_limit);
-        return srtp_err_status_key_expired;
-    default:
-        break;
+    status = srtp_account_key_usage(ctx, stream, session_keys,
+                                    srtp_key_protocol_rtp);
+    if (status) {
+        return status;
     }
 
     if (hdr->x == 1 && session_keys->rtp_xtn_hdr_cipher) {
@@ -4033,6 +4101,7 @@ static srtp_err_status_t srtp_calc_aead_iv_srtcp(
  * AES-GCM mode with 128 or 256 bit keys.
  */
 static srtp_err_status_t srtp_protect_rtcp_aead(
+    srtp_ctx_t *ctx,
     srtp_stream_ctx_t *stream,
     const uint8_t *rtcp,
     size_t rtcp_len,
@@ -4093,6 +4162,11 @@ static srtp_err_status_t srtp_protect_rtcp_aead(
      * if its value isn't too big
      */
     status = srtp_rdb_increment(&stream->rtcp_rdb);
+    if (status == srtp_err_status_key_expired) {
+        /* the 31-bit SRTCP index would wrap: re-keying is required */
+        srtp_handle_event(ctx, stream, event_packet_index_limit);
+        return status;
+    }
     if (status) {
         return status;
     }
@@ -4101,6 +4175,16 @@ static srtp_err_status_t srtp_protect_rtcp_aead(
     debug_print(mod_srtp, "srtcp index: %x", (unsigned int)seq_num);
 
     memcpy(trailer_p, &trailer, sizeof(trailer));
+
+    /*
+     * A new SRTCP index is about to be protected, so account it against
+     * the SRTCP key usage budget, independently of the SRTP budget.
+     */
+    status = srtp_account_key_usage(ctx, stream, session_keys,
+                                    srtp_key_protocol_rtcp);
+    if (status) {
+        return status;
+    }
 
     /*
      * Calculate and set the IV
@@ -4384,6 +4468,18 @@ static srtp_err_status_t srtp_unprotect_rtcp_aead(
         stream = new_stream;
     }
 
+    /*
+     * The GCM tag verified and the index is genuine, so account it
+     * against the SRTCP key usage budget.  Replayed or unauthenticated
+     * packets returned earlier and never consume budget.  Accounting
+     * before the replay update means a refused packet leaves no state.
+     */
+    status = srtp_account_key_usage(ctx, stream, session_keys,
+                                    srtp_key_protocol_rtcp);
+    if (status) {
+        return status;
+    }
+
     /* we've passed the authentication check, so add seq_num to the rdb */
     srtp_rdb_add_index(&stream->rtcp_rdb, seq_num);
 
@@ -4480,8 +4576,8 @@ srtp_err_status_t srtp_protect_rtcp(srtp_t ctx,
      */
     if (session_keys->rtp_cipher->algorithm == SRTP_AES_GCM_128 ||
         session_keys->rtp_cipher->algorithm == SRTP_AES_GCM_256) {
-        return srtp_protect_rtcp_aead(stream, rtcp, rtcp_len, srtcp, srtcp_len,
-                                      session_keys);
+        return srtp_protect_rtcp_aead(ctx, stream, rtcp, rtcp_len, srtcp,
+                                      srtcp_len, session_keys);
     }
 
     /* get tag length from stream context */
@@ -4536,6 +4632,11 @@ srtp_err_status_t srtp_protect_rtcp(srtp_t ctx,
      * if its value isn't too big
      */
     status = srtp_rdb_increment(&stream->rtcp_rdb);
+    if (status == srtp_err_status_key_expired) {
+        /* the 31-bit SRTCP index would wrap: re-keying is required */
+        srtp_handle_event(ctx, stream, event_packet_index_limit);
+        return status;
+    }
     if (status) {
         return status;
     }
@@ -4544,6 +4645,16 @@ srtp_err_status_t srtp_protect_rtcp(srtp_t ctx,
     debug_print(mod_srtp, "srtcp index: %x", (unsigned int)seq_num);
 
     memcpy(trailer_p, &trailer, sizeof(trailer));
+
+    /*
+     * A new SRTCP index is about to be protected, so account it against
+     * the SRTCP key usage budget, independently of the SRTP budget.
+     */
+    status = srtp_account_key_usage(ctx, stream, session_keys,
+                                    srtp_key_protocol_rtcp);
+    if (status) {
+        return status;
+    }
 
     /*
      * if we're using rindael counter mode, set nonce and seq
@@ -4925,6 +5036,19 @@ srtp_err_status_t srtp_unprotect_rtcp(srtp_t ctx,
         stream = new_stream;
     }
 
+    /*
+     * The authentication tag matched and the index is genuine, so
+     * account it against the SRTCP key usage budget.  Replayed packets
+     * and failed tags returned earlier and never consume budget.
+     * Accounting before the replay update means a refused packet leaves
+     * no state behind.
+     */
+    status = srtp_account_key_usage(ctx, stream, session_keys,
+                                    srtp_key_protocol_rtcp);
+    if (status) {
+        return status;
+    }
+
     /* we've passed the authentication check, so add seq_num to the rdb */
     srtp_rdb_add_index(&stream->rtcp_rdb, seq_num);
 
@@ -5283,6 +5407,58 @@ srtp_err_status_t srtp_stream_get_packet_index(srtp_t session,
     }
 
     *index = stream->rtp_rdbx.index + 1;
+
+    return srtp_err_status_ok;
+}
+
+srtp_err_status_t srtp_stream_get_key_usage(srtp_t session,
+                                            uint32_t ssrc,
+                                            srtp_key_usage_protocol_t protocol,
+                                            srtp_key_usage_t *usage)
+{
+    srtp_stream_t stream;
+    srtp_key_protocol_t internal_protocol;
+    srtp_key_state_t state;
+
+    if (session == NULL || usage == NULL) {
+        return srtp_err_status_bad_param;
+    }
+
+    switch (protocol) {
+    case srtp_key_usage_rtp:
+        internal_protocol = srtp_key_protocol_rtp;
+        break;
+    case srtp_key_usage_rtcp:
+        internal_protocol = srtp_key_protocol_rtcp;
+        break;
+    default:
+        return srtp_err_status_bad_param;
+    }
+
+    stream = srtp_get_stream(session, htonl(ssrc));
+    if (stream == NULL || stream->session_keys == NULL ||
+        stream->session_keys[0].limit == NULL) {
+        return srtp_err_status_bad_param;
+    }
+
+    state = srtp_key_limit_get_state(stream->session_keys[0].limit,
+                                     internal_protocol);
+    switch (state) {
+    case srtp_key_state_past_soft_limit:
+        usage->state = srtp_key_usage_soft_limit;
+        break;
+    case srtp_key_state_expired:
+        usage->state = srtp_key_usage_expired;
+        break;
+    case srtp_key_state_normal:
+    default:
+        usage->state = srtp_key_usage_normal;
+        break;
+    }
+
+    usage->protocol = protocol;
+    usage->packets_remaining = srtp_key_limit_get_remaining(
+        stream->session_keys[0].limit, internal_protocol);
 
     return srtp_err_status_ok;
 }

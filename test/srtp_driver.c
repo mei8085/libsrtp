@@ -155,6 +155,12 @@ srtp_err_status_t srtp_test_cryptex_not_in_place_distinct_buffer(void);
 
 srtp_err_status_t srtp_test_missing_session_keys(void);
 
+srtp_err_status_t srtp_test_key_usage(void);
+
+srtp_err_status_t srtp_test_key_usage_ignores_invalid_packets(void);
+
+srtp_err_status_t srtp_test_key_usage_rekey_reset(void);
+
 double srtp_bits_per_second(size_t msg_len_octets,
                             const test_policy_t *test_policy);
 
@@ -994,6 +1000,31 @@ int main(int argc, char *argv[])
 
         printf("testing srtp_test_initial_indices()...");
         if (srtp_test_initial_indices() == srtp_err_status_ok) {
+            printf("passed\n");
+        } else {
+            printf("failed\n");
+            exit(1);
+        }
+
+        printf("testing srtp_test_key_usage()...");
+        if (srtp_test_key_usage() == srtp_err_status_ok) {
+            printf("passed\n");
+        } else {
+            printf("failed\n");
+            exit(1);
+        }
+
+        printf("testing srtp_test_key_usage_ignores_invalid_packets()...");
+        if (srtp_test_key_usage_ignores_invalid_packets() ==
+            srtp_err_status_ok) {
+            printf("passed\n");
+        } else {
+            printf("failed\n");
+            exit(1);
+        }
+
+        printf("testing srtp_test_key_usage_rekey_reset()...");
+        if (srtp_test_key_usage_rekey_reset() == srtp_err_status_ok) {
             printf("passed\n");
         } else {
             printf("failed\n");
@@ -6897,6 +6928,390 @@ srtp_err_status_t srtp_test_initial_indices(void)
     srtp_policy_destroy(updated);
 
     return srtp_err_status_ok;
+}
+
+/*
+ * Fetch the key limit object of the stream for ssrc.  ssrc_specific
+ * policies put the stream on the stream list rather than in the
+ * (optional) template, so it must be looked up directly.
+ */
+static srtp_key_limit_t test_get_key_limit(srtp_t session, uint32_t ssrc)
+{
+    srtp_stream_t stream = srtp_get_stream(session, htonl(ssrc));
+    if (stream == NULL || stream->session_keys == NULL) {
+        return NULL;
+    }
+    return stream->session_keys[0].limit;
+}
+
+/* like make_specific_policy, but with a caller-chosen profile */
+static srtp_err_status_t make_specific_policy_profile(srtp_policy_t *policy,
+                                                      uint32_t ssrc,
+                                                      srtp_profile_t profile)
+{
+    CHECK_OK(srtp_policy_create(policy));
+    CHECK_OK(srtp_policy_set_profile(*policy, profile));
+    CHECK_OK(policy_set_key(*policy, test_key));
+    CHECK_OK(
+        srtp_policy_set_ssrc(*policy, (srtp_ssrc_t){ ssrc_specific, ssrc }));
+    return srtp_err_status_ok;
+}
+
+/*
+ * Verify that the SRTP and SRTCP key usage budgets are accumulated
+ * independently, that the observable state moves through normal, soft
+ * limit and hard limit, and that the remaining budget matches the
+ * number of packets actually processed.
+ */
+static srtp_err_status_t srtp_test_key_usage_impl(srtp_profile_t profile)
+{
+    const uint32_t ssrc = 0xdecafbad;
+    /*
+     * The smallest accepted budget is the soft-limit window (0x10000):
+     * the first packet enters the soft-limit state and the last packet
+     * reaches the hard limit.
+     */
+    const uint64_t rtp_budget = 0x10000 + 2;
+    const uint64_t rtcp_budget = 0x10000;
+    srtp_policy_t policy;
+    srtp_t session;
+    srtp_key_limit_t limit;
+    srtp_key_usage_t usage;
+    uint16_t seq = 0;
+
+    CHECK_OK(make_specific_policy_profile(&policy, ssrc, profile));
+    CHECK_OK(srtp_create(&session, policy));
+
+    /* the stream exists immediately for an ssrc_specific policy */
+    limit = test_get_key_limit(session, ssrc);
+    CHECK(limit != NULL);
+
+    /* shrink both budgets so the full lifecycle is reachable quickly */
+    CHECK_OK(srtp_key_limit_set(limit, srtp_key_protocol_rtp, rtp_budget));
+    CHECK_OK(srtp_key_limit_set(limit, srtp_key_protocol_rtcp, rtcp_budget));
+
+    /* first SRTP packet consumes one unit of the SRTP budget */
+    CHECK_OK(protect_rtp_seq(session, ssrc, seq++));
+    CHECK_OK(srtp_stream_get_key_usage(session, ssrc, srtp_key_usage_rtp,
+                                       &usage));
+    CHECK(usage.state == srtp_key_usage_normal);
+    CHECK(usage.packets_remaining == rtp_budget - 1);
+
+    /* SRTCP must have its own, untouched budget */
+    CHECK_OK(srtp_stream_get_key_usage(session, ssrc, srtp_key_usage_rtcp,
+                                       &usage));
+    CHECK(usage.state == srtp_key_usage_normal);
+    CHECK(usage.packets_remaining == rtcp_budget);
+
+    /* one SRTCP packet crosses its soft-limit window (budget == window) */
+    CHECK_OK(protect_one_rtcp(session, ssrc));
+    CHECK_OK(srtp_stream_get_key_usage(session, ssrc, srtp_key_usage_rtcp,
+                                       &usage));
+    CHECK(usage.state == srtp_key_usage_soft_limit);
+    CHECK(usage.packets_remaining == rtcp_budget - 1);
+    CHECK_OK(srtp_stream_get_key_usage(session, ssrc, srtp_key_usage_rtp,
+                                       &usage));
+    CHECK(usage.packets_remaining == rtp_budget - 1);
+
+    /* exhaust the SRTCP budget; the final packet itself reports expiry */
+    for (uint64_t i = 2; i < rtcp_budget; i++) {
+        CHECK_OK(protect_one_rtcp(session, ssrc));
+    }
+    CHECK_RETURN(protect_one_rtcp(session, ssrc),
+                 srtp_err_status_key_expired);
+    CHECK_OK(srtp_stream_get_key_usage(session, ssrc, srtp_key_usage_rtcp,
+                                       &usage));
+    CHECK(usage.state == srtp_key_usage_expired);
+    CHECK(usage.packets_remaining == 0);
+    CHECK_RETURN(protect_one_rtcp(session, ssrc),
+                 srtp_err_status_key_expired);
+
+    /* the SRTP budget was not touched by any of the SRTCP packets */
+    CHECK_OK(srtp_stream_get_key_usage(session, ssrc, srtp_key_usage_rtp,
+                                       &usage));
+    CHECK(usage.packets_remaining == rtp_budget - 1);
+    CHECK_OK(protect_rtp_seq(session, ssrc, seq++));
+
+    /* exhaust the SRTP budget and watch the soft-limit transition */
+    while (true) {
+        srtp_err_status_t status = protect_rtp_seq(session, ssrc, seq++);
+        CHECK_OK(srtp_stream_get_key_usage(session, ssrc, srtp_key_usage_rtp,
+                                           &usage));
+        if (status == srtp_err_status_key_expired) {
+            CHECK(usage.state == srtp_key_usage_expired);
+            CHECK(usage.packets_remaining == 0);
+            break;
+        }
+        CHECK_OK(status);
+    }
+    CHECK_RETURN(protect_rtp_seq(session, ssrc, seq),
+                 srtp_err_status_key_expired);
+
+    srtp_dealloc(session);
+    srtp_policy_destroy(policy);
+
+    return srtp_err_status_ok;
+}
+
+/*
+ * Replayed packets and packets that fail authentication must not consume
+ * any key usage budget, on either the SRTP or SRTCP path.
+ */
+static srtp_err_status_t srtp_test_key_usage_ignores_invalid_packets_impl(
+    srtp_profile_t profile)
+{
+    const uint32_t ssrc = 0xbedabb1e;
+    /* budgets must be at least the 0x10000 soft-limit window */
+    const uint64_t budget = 0x20000;
+    srtp_policy_t policy;
+    srtp_t sender;
+    srtp_t receiver;
+    srtp_key_limit_t limit;
+    srtp_key_usage_t usage;
+    size_t len;
+    size_t protected_len;
+    size_t copy_len;
+    uint8_t *pkt;
+    uint8_t *copy;
+
+    CHECK_OK(make_specific_policy_profile(&policy, ssrc, profile));
+    CHECK_OK(srtp_policy_set_allow_repeat_tx(policy, true));
+    CHECK_OK(srtp_create(&sender, policy));
+    CHECK_OK(srtp_create(&receiver, policy));
+
+    limit = test_get_key_limit(sender, ssrc);
+    CHECK(limit != NULL);
+    CHECK_OK(srtp_key_limit_set(limit, srtp_key_protocol_rtp, budget));
+    CHECK_OK(srtp_key_limit_set(limit, srtp_key_protocol_rtcp, budget));
+    limit = test_get_key_limit(receiver, ssrc);
+    CHECK(limit != NULL);
+    CHECK_OK(srtp_key_limit_set(limit, srtp_key_protocol_rtp, budget));
+    CHECK_OK(srtp_key_limit_set(limit, srtp_key_protocol_rtcp, budget));
+
+    /* one genuine SRTP packet round trip */
+    pkt = create_rtp_test_packet(32, ssrc, 7, 1, false, &len, NULL);
+    if (pkt == NULL) {
+        return srtp_err_status_alloc_fail;
+    }
+    CHECK_OK(call_srtp_protect(sender, pkt, &len, 0));
+    protected_len = len;
+
+    /* keep a protected copy: in-place unprotect overwrites the packet */
+    copy = malloc(protected_len);
+    if (copy == NULL) {
+        free(pkt);
+        return srtp_err_status_alloc_fail;
+    }
+    memcpy(copy, pkt, protected_len);
+    CHECK_OK(call_srtp_unprotect(receiver, pkt, &len));
+
+    /* replaying the protected copy must not change the receiver budget */
+    copy_len = protected_len;
+    CHECK_RETURN(call_srtp_unprotect(receiver, copy, &copy_len),
+                 srtp_err_status_replay_fail);
+    free(copy);
+    CHECK_OK(srtp_stream_get_key_usage(receiver, ssrc, srtp_key_usage_rtp,
+                                       &usage));
+    CHECK(usage.packets_remaining == budget - 1);
+
+    /* a fresh packet with a corrupted tag must fail authentication */
+    free(pkt);
+    pkt = create_rtp_test_packet(32, ssrc, 8, 1, false, &len, NULL);
+    if (pkt == NULL) {
+        return srtp_err_status_alloc_fail;
+    }
+    CHECK_OK(call_srtp_protect(sender, pkt, &len, 0));
+    pkt[len - 1] ^= 0xff;
+    CHECK_RETURN(call_srtp_unprotect(receiver, pkt, &len),
+                 srtp_err_status_auth_fail);
+    CHECK_OK(srtp_stream_get_key_usage(receiver, ssrc, srtp_key_usage_rtp,
+                                       &usage));
+    /* the sender spent one packet; the rejected packet cost the receiver
+     * nothing, so its budget is still budget - 1 */
+    CHECK(usage.packets_remaining == budget - 1);
+    free(pkt);
+
+    /* repeated transmissions from the sender reuse an index: no new spend */
+    pkt = create_rtp_test_packet(32, ssrc, 7, 1, false, &len, NULL);
+    if (pkt == NULL) {
+        return srtp_err_status_alloc_fail;
+    }
+    CHECK_OK(call_srtp_protect(sender, pkt, &len, 0));
+    CHECK_OK(srtp_stream_get_key_usage(sender, ssrc, srtp_key_usage_rtp,
+                                       &usage));
+    /* two genuine indices (seq 7 and 8) spent; the repeat adds nothing */
+    CHECK(usage.packets_remaining == budget - 2);
+    free(pkt);
+
+    /* SRTCP: one genuine packet, then a replay and a corrupted packet */
+    pkt = create_rtcp_test_packet(32, ssrc, &len, NULL);
+    if (pkt == NULL) {
+        return srtp_err_status_alloc_fail;
+    }
+    CHECK_OK(call_srtp_protect_rtcp(sender, pkt, &len, 0));
+    protected_len = len;
+
+    /* keep a protected copy: in-place unprotect overwrites the packet */
+    copy = malloc(protected_len);
+    if (copy == NULL) {
+        free(pkt);
+        return srtp_err_status_alloc_fail;
+    }
+    memcpy(copy, pkt, protected_len);
+    CHECK_OK(call_srtp_unprotect_rtcp(receiver, pkt, &len));
+
+    /* the replay needs the protected length, which unprotect overwrote */
+    copy_len = protected_len;
+    CHECK_RETURN(call_srtp_unprotect_rtcp(receiver, copy, &copy_len),
+                 srtp_err_status_replay_fail);
+    free(copy);
+
+    /* a fresh SRTCP packet with a corrupted tag fails authentication */
+    free(pkt);
+    pkt = create_rtcp_test_packet(32, ssrc, &len, NULL);
+    if (pkt == NULL) {
+        return srtp_err_status_alloc_fail;
+    }
+    CHECK_OK(call_srtp_protect_rtcp(sender, pkt, &len, 0));
+    pkt[len - 1] ^= 0xff;
+    CHECK_RETURN(call_srtp_unprotect_rtcp(receiver, pkt, &len),
+                 srtp_err_status_auth_fail);
+    CHECK_OK(srtp_stream_get_key_usage(receiver, ssrc, srtp_key_usage_rtcp,
+                                       &usage));
+    /* the rejected packet cost the receiver nothing */
+    CHECK(usage.packets_remaining == budget - 1);
+    free(pkt);
+
+    srtp_dealloc(sender);
+    srtp_dealloc(receiver);
+    srtp_policy_destroy(policy);
+
+    return srtp_err_status_ok;
+}
+
+/*
+ * Re-deriving the master key through srtp_update() must reset both
+ * protocol counters to a fresh, normal state, and a brand new session
+ * must never inherit the exhausted state of an earlier session.
+ */
+static srtp_err_status_t srtp_test_key_usage_rekey_reset_impl(
+    srtp_profile_t profile)
+{
+    const uint32_t ssrc = 0x5eed1234;
+    /*
+     * Budgets are the soft-limit window plus a small margin, so the hard
+     * limit is reached while the RTP sequence number is still in the
+     * first ROC period and the 31-bit SRTCP index is far from its
+     * ceiling.  Only the key budget (not an index boundary) is exercised.
+     */
+    const uint64_t rtp_budget = 0x20000 + 8;
+    const uint64_t rtcp_budget = 0x10000 + 4;
+    srtp_policy_t policy;
+    srtp_t session;
+    srtp_key_limit_t limit;
+    srtp_key_usage_t usage;
+    uint16_t next_seq = 0;
+
+    CHECK_OK(make_specific_policy_profile(&policy, ssrc, profile));
+    CHECK_OK(srtp_create(&session, policy));
+    limit = test_get_key_limit(session, ssrc);
+    CHECK(limit != NULL);
+    CHECK_OK(srtp_key_limit_set(limit, srtp_key_protocol_rtp, rtp_budget));
+    CHECK_OK(srtp_key_limit_set(limit, srtp_key_protocol_rtcp, rtcp_budget));
+
+    /* run until the smaller SRTCP budget expires */
+    for (uint64_t i = 0; i < rtcp_budget - 1; i++) {
+        CHECK_OK(protect_rtp_seq(session, ssrc, next_seq++));
+        CHECK_OK(protect_one_rtcp(session, ssrc));
+    }
+    CHECK_OK(protect_rtp_seq(session, ssrc, next_seq++));
+    CHECK_RETURN(protect_one_rtcp(session, ssrc),
+                 srtp_err_status_key_expired);
+
+    /* the SRTCP budget is exhausted while the SRTP budget still has room */
+    CHECK_OK(srtp_stream_get_key_usage(session, ssrc, srtp_key_usage_rtcp,
+                                       &usage));
+    CHECK(usage.state == srtp_key_usage_expired);
+    CHECK(usage.packets_remaining == 0);
+    CHECK_OK(srtp_stream_get_key_usage(session, ssrc, srtp_key_usage_rtp,
+                                       &usage));
+    CHECK(usage.state == srtp_key_usage_normal);
+    CHECK(usage.packets_remaining ==
+          rtp_budget - rtcp_budget);
+    CHECK_RETURN(protect_one_rtcp(session, ssrc),
+                 srtp_err_status_key_expired);
+
+    /* exhaust the SRTP budget as well */
+    for (uint64_t i = 0; i < rtp_budget - rtcp_budget - 1; i++) {
+        CHECK_OK(protect_rtp_seq(session, ssrc, next_seq++));
+    }
+    CHECK_RETURN(protect_rtp_seq(session, ssrc, next_seq++),
+                 srtp_err_status_key_expired);
+    CHECK_OK(srtp_stream_get_key_usage(session, ssrc, srtp_key_usage_rtp,
+                                       &usage));
+    CHECK(usage.state == srtp_key_usage_expired);
+    CHECK(usage.packets_remaining == 0);
+
+    /* re-derive the master key: counters must start over, indices survive */
+    CHECK_OK(srtp_update(session, policy));
+    CHECK_OK(srtp_stream_get_key_usage(session, ssrc, srtp_key_usage_rtp,
+                                       &usage));
+    CHECK(usage.state == srtp_key_usage_normal);
+    CHECK(usage.packets_remaining == SRTP_PACKET_INDEX_MAX);
+    CHECK_OK(srtp_stream_get_key_usage(session, ssrc, srtp_key_usage_rtcp,
+                                       &usage));
+    CHECK(usage.state == srtp_key_usage_normal);
+    CHECK(usage.packets_remaining == SRTP_PACKET_INDEX_MAX);
+
+    /* sending works again under the fresh derived keys, on advancing indices */
+    CHECK_OK(protect_rtp_seq(session, ssrc, next_seq++));
+    CHECK_OK(protect_one_rtcp(session, ssrc));
+
+    srtp_dealloc(session);
+    srtp_policy_destroy(policy);
+
+    /* a completely new session starts normal regardless of prior usage */
+    CHECK_OK(make_specific_policy_profile(&policy, ssrc, profile));
+    CHECK_OK(srtp_create(&session, policy));
+    CHECK_OK(protect_rtp_seq(session, ssrc, 0));
+    CHECK_OK(srtp_stream_get_key_usage(session, ssrc, srtp_key_usage_rtp,
+                                       &usage));
+    CHECK(usage.state == srtp_key_usage_normal);
+    CHECK(usage.packets_remaining == SRTP_PACKET_INDEX_MAX - 1);
+    srtp_dealloc(session);
+    srtp_policy_destroy(policy);
+
+    return srtp_err_status_ok;
+}
+
+/*
+ * Run a key-usage test against both the classic AES-CM/HMAC-SHA1 profile
+ * and, when available, the AES-GCM AEAD profile, since the usage counters
+ * are updated from both the non-AEAD and AEAD code paths.
+ */
+static srtp_err_status_t test_key_usage_run(
+    srtp_err_status_t (*fn)(srtp_profile_t profile))
+{
+    CHECK_OK(fn(srtp_profile_aes128_cm_sha1_80));
+#ifdef HAVE_GCM
+    CHECK_OK(fn(srtp_profile_aead_aes_128_gcm));
+#endif
+    return srtp_err_status_ok;
+}
+
+srtp_err_status_t srtp_test_key_usage(void)
+{
+    return test_key_usage_run(srtp_test_key_usage_impl);
+}
+
+srtp_err_status_t srtp_test_key_usage_ignores_invalid_packets(void)
+{
+    return test_key_usage_run(srtp_test_key_usage_ignores_invalid_packets_impl);
+}
+
+srtp_err_status_t srtp_test_key_usage_rekey_reset(void)
+{
+    return test_key_usage_run(srtp_test_key_usage_rekey_reset_impl);
 }
 
 /* This test illustrates how the ROC can be mismatched between

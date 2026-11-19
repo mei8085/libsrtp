@@ -54,19 +54,22 @@ extern "C" {
 
 typedef struct srtp_key_limit_ctx_t *srtp_key_limit_t;
 
+/*
+ * The protocol whose traffic is being metered.  SRTP and SRTCP derive
+ * separate session keys (and separate keystream counters) from the same
+ * master key, so their usage is accumulated independently.
+ */
+typedef enum {
+    srtp_key_protocol_rtp = 0,
+    srtp_key_protocol_rtcp = 1,
+    srtp_key_protocol_count
+} srtp_key_protocol_t;
+
 typedef enum {
     srtp_key_event_normal,
     srtp_key_event_soft_limit,
     srtp_key_event_hard_limit
 } srtp_key_event_t;
-
-srtp_err_status_t srtp_key_limit_set(srtp_key_limit_t key,
-                                     const srtp_xtd_seq_num_t s);
-
-srtp_err_status_t srtp_key_limit_clone(srtp_key_limit_t original,
-                                       srtp_key_limit_t *new_key);
-
-srtp_key_event_t srtp_key_limit_update(srtp_key_limit_t key);
 
 typedef enum {
     srtp_key_state_normal,
@@ -74,9 +77,52 @@ typedef enum {
     srtp_key_state_expired
 } srtp_key_state_t;
 
-typedef struct srtp_key_limit_ctx_t {
+/*
+ * srtp_key_limit_init(key) initializes a freshly allocated key limit
+ * context.  Both protocol counters start with the full 48-bit packet
+ * budget and in the normal state.  A new session (or a re-derived master
+ * key) therefore never inherits the exhausted state of a previous one.
+ */
+srtp_err_status_t srtp_key_limit_init(srtp_key_limit_t key);
+
+/*
+ * srtp_key_limit_set(key, protocol, s) sets the number of packets that
+ * may still be sent under 'protocol' to s, and clears that protocol's
+ * soft/hard limit state.  Values below soft_limit are rejected so that a
+ * usable soft-limit window always exists.
+ */
+srtp_err_status_t srtp_key_limit_set(srtp_key_limit_t key,
+                                     srtp_key_protocol_t protocol,
+                                     const srtp_xtd_seq_num_t s);
+
+srtp_err_status_t srtp_key_limit_clone(srtp_key_limit_t original,
+                                       srtp_key_limit_t *new_key);
+
+/*
+ * srtp_key_limit_update(key, protocol) accounts for one packet that was
+ * actually protected or successfully unprotected for 'protocol'.  Packets
+ * rejected as replays or failing authentication must not be accounted:
+ * call this only once the packet is known to be genuine.
+ */
+srtp_key_event_t srtp_key_limit_update(srtp_key_limit_t key,
+                                       srtp_key_protocol_t protocol);
+
+/* Number of packets still available for the given protocol. */
+srtp_xtd_seq_num_t srtp_key_limit_get_remaining(
+    srtp_key_limit_t key, srtp_key_protocol_t protocol);
+
+/* Current lifecycle state of the given protocol's counter. */
+srtp_key_state_t srtp_key_limit_get_state(srtp_key_limit_t key,
+                                          srtp_key_protocol_t protocol);
+
+typedef struct srtp_key_limit_counter_t {
     srtp_xtd_seq_num_t num_left;
     srtp_key_state_t state;
+} srtp_key_limit_counter_t;
+
+typedef struct srtp_key_limit_ctx_t {
+    /* independent budgets for the SRTP and SRTCP session keys */
+    srtp_key_limit_counter_t counter[srtp_key_protocol_count];
 } srtp_key_limit_ctx_t;
 
 #ifdef __cplusplus

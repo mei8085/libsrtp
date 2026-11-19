@@ -50,14 +50,35 @@
 
 #define soft_limit 0x10000
 
-srtp_err_status_t srtp_key_limit_set(srtp_key_limit_t key,
-                                     const srtp_xtd_seq_num_t s)
+/*
+ * Full packet budget for a derived session key.  The SRTP packet index
+ * is 48 bits wide; the highest usable index is 2^48 - 1.
+ */
+#define key_limit_max ((srtp_xtd_seq_num_t)0xffffffffffff)
+
+srtp_err_status_t srtp_key_limit_init(srtp_key_limit_t key)
 {
-    if (s < soft_limit) {
+    if (key == NULL) {
         return srtp_err_status_bad_param;
     }
-    key->num_left = s;
-    key->state = srtp_key_state_normal;
+
+    for (size_t i = 0; i < srtp_key_protocol_count; i++) {
+        key->counter[i].num_left = key_limit_max;
+        key->counter[i].state = srtp_key_state_normal;
+    }
+    return srtp_err_status_ok;
+}
+
+srtp_err_status_t srtp_key_limit_set(srtp_key_limit_t key,
+                                     srtp_key_protocol_t protocol,
+                                     const srtp_xtd_seq_num_t s)
+{
+    if (key == NULL || protocol >= srtp_key_protocol_count ||
+        s < soft_limit) {
+        return srtp_err_status_bad_param;
+    }
+    key->counter[protocol].num_left = s;
+    key->counter[protocol].state = srtp_key_state_normal;
     return srtp_err_status_ok;
 }
 
@@ -71,20 +92,52 @@ srtp_err_status_t srtp_key_limit_clone(srtp_key_limit_t original,
     return srtp_err_status_ok;
 }
 
-srtp_key_event_t srtp_key_limit_update(srtp_key_limit_t key)
+srtp_key_event_t srtp_key_limit_update(srtp_key_limit_t key,
+                                       srtp_key_protocol_t protocol)
 {
-    key->num_left--;
-    if (key->num_left >= soft_limit) {
+    srtp_key_limit_counter_t *c;
+
+    if (key == NULL || protocol >= srtp_key_protocol_count) {
+        /*
+         * An internal misuse must not silently consume or extend a
+         * budget: report the hard limit so that no packet is sent.
+         */
+        return srtp_key_event_hard_limit;
+    }
+
+    c = &key->counter[protocol];
+    if (c->num_left > 0) {
+        c->num_left--;
+    }
+    if (c->num_left >= soft_limit) {
         return srtp_key_event_normal; /* we're above the soft limit */
     }
-    if (key->state == srtp_key_state_normal) {
+    if (c->state == srtp_key_state_normal) {
         /* we just passed the soft limit, so change the state */
-        key->state = srtp_key_state_past_soft_limit;
+        c->state = srtp_key_state_past_soft_limit;
     }
-    if (key->num_left < 1) {
+    if (c->num_left < 1) {
         /* we just hit the hard limit */
-        key->state = srtp_key_state_expired;
+        c->state = srtp_key_state_expired;
         return srtp_key_event_hard_limit;
     }
     return srtp_key_event_soft_limit;
+}
+
+srtp_xtd_seq_num_t srtp_key_limit_get_remaining(
+    srtp_key_limit_t key, srtp_key_protocol_t protocol)
+{
+    if (key == NULL || protocol >= srtp_key_protocol_count) {
+        return 0;
+    }
+    return key->counter[protocol].num_left;
+}
+
+srtp_key_state_t srtp_key_limit_get_state(srtp_key_limit_t key,
+                                          srtp_key_protocol_t protocol)
+{
+    if (key == NULL || protocol >= srtp_key_protocol_count) {
+        return srtp_key_state_expired;
+    }
+    return key->counter[protocol].state;
 }

@@ -2,6 +2,11 @@ Changelog
 
 2.6.0
 
+- Track SRTP and SRTCP key usage independently with separate soft/hard
+  limit counters and a new srtp_stream_get_key_usage() observer API.
+  Replayed and unauthenticated packets no longer consume key budget, and
+  the packet index ceiling is reported as event_packet_index_limit.
+
 #667 - remove use of pointers to 32bit values
 
 #666 - Cleaning up cmake and enabled more warnings.

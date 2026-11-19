@@ -65,6 +65,13 @@ extern "C" {
 #define SRTP_VER_STRING PACKAGE_STRING
 #define SRTP_VERSION PACKAGE_VERSION
 
+/*
+ * Highest value the 48-bit extended SRTP packet index (ROC || seq) can
+ * take before wrapping.  One more packet would reuse an IV under the same
+ * derived key and must be refused until the master key is re-derived.
+ */
+#define SRTP_PACKET_INDEX_MAX ((uint64_t)0xffffffffffff)
+
 typedef struct srtp_stream_ctx_t_ srtp_stream_ctx_t;
 typedef srtp_stream_ctx_t *srtp_stream_t;
 typedef struct srtp_stream_list_ctx_t_ *srtp_stream_list_t;
