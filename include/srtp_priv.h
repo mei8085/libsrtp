@@ -161,6 +161,78 @@ typedef enum direction_t {
 } direction_t;
 
 /*
+ * Length in octets of the fingerprint that identifies one key epoch.
+ *
+ * An SRTP nonce is a function of the session key and of the packet index, so
+ * the pair (key, packet index) is what must never repeat.  The fingerprint of
+ * the derived RTP key material lets a stream tell "this is the same key"
+ * (keep the used-nonce history) apart from "this is a new key" (which opens a
+ * fresh nonce space), and lets an old key that is installed again be
+ * recognised instead of being mistaken for a new one.
+ */
+#define SRTP_KEY_EPOCH_LEN 20
+
+/*
+ * Key epochs whose used-nonce history is retained per stream.  At least as many
+ * as the master keys an MKI policy may hold, so that a stream that alternates
+ * between all of its configured keys never evicts one of them.
+ */
+#define SRTP_NONCE_EPOCHS SRTP_MAX_NUM_MASTER_KEYS
+/* fingerprints of epochs whose history was evicted; they may not send again */
+#define SRTP_NONCE_STALE_LEN 16
+/* guards of removed streams retained per session, keyed by SSRC */
+#define SRTP_NONCE_STASH_LEN 8
+/* width in bits of the used-index window kept per key epoch */
+#define SRTP_NONCE_WINDOW 128
+#define SRTP_NONCE_WINDOW_WORDS (SRTP_NONCE_WINDOW / 32)
+
+/*
+ * The used-nonce history of one key epoch.  "high" is the largest packet index
+ * protected with this key on this stream and "used" is a window ending at it:
+ * bit (high - index) stands for "index", so bit 0 is "high" itself and the
+ * highest bits are the oldest indices still tracked.  Every index whose bit is
+ * set has consumed its nonce; an index further than SRTP_NONCE_WINDOW below
+ * "high" is treated as used because the window can no longer prove otherwise.
+ */
+typedef struct {
+    bool valid;
+    uint8_t epoch_id[SRTP_KEY_EPOCH_LEN];
+    bool started;
+    srtp_xtd_seq_num_t high;
+    uint32_t used[SRTP_NONCE_WINDOW_WORDS];
+    uint64_t last_used;
+} srtp_nonce_epoch_t;
+
+/*
+ * Per-stream nonce guard for the sending direction.  It binds the packet
+ * index and the key epoch to the nonces that have actually been used, so that:
+ *   - a repeated index within one epoch is refused instead of re-using the
+ *     keystream (and, for the AEAD profiles, the GCM nonce),
+ *   - a sequence-number roll-over advances the index and is accepted,
+ *   - re-keying starts a fresh nonce space, while re-enabling an old key
+ *     resumes (or refuses) its own history rather than treating it as new.
+ * The state is committed only after a packet has been protected successfully,
+ * so a failed send leaves later packets of the same stream unaffected.
+ */
+typedef struct {
+    uint64_t clock;
+    size_t stale_count;
+    uint8_t stale_id[SRTP_NONCE_STALE_LEN][SRTP_KEY_EPOCH_LEN];
+    srtp_nonce_epoch_t epoch[SRTP_NONCE_EPOCHS];
+} srtp_nonce_guard_t;
+
+/*
+ * A guard detached from a removed stream and kept by the session, so that
+ * removing and re-adding a stream with the same SSRC cannot silently reset
+ * the used-nonce history and let an old key look like a new one.
+ */
+typedef struct {
+    bool valid;
+    uint32_t ssrc;
+    srtp_nonce_guard_t guard;
+} srtp_nonce_stash_t;
+
+/*
  * srtp_session_keys_t will contain the encryption, hmac, salt keys
  * for both SRTP and SRTCP.  The session keys will also contain the
  * MKI ID which is used to identify the session keys.
@@ -175,6 +247,8 @@ typedef struct srtp_session_keys_t {
     uint8_t c_salt[SRTP_AEAD_SALT_LEN];
     uint8_t *mki_id;
     srtp_key_limit_ctx_t *limit;
+    /* fingerprint of the derived RTP key material for this key slot */
+    uint8_t epoch_id[SRTP_KEY_EPOCH_LEN];
 } srtp_session_keys_t;
 
 /*
@@ -202,6 +276,7 @@ typedef struct srtp_stream_ctx_t_ {
     bool use_cryptex;
     srtp_rcc_mode_t rcc_mode; /* RFC 4771 RCC integrity transform mode      */
     uint16_t roc_tx_rate;     /* RFC 4771 ROC transmission rate R (>= 1)    */
+    srtp_nonce_guard_t nonce_guard; /* sending-direction nonce guard        */
 } strp_stream_ctx_t_;
 
 /*
@@ -212,6 +287,8 @@ typedef struct srtp_ctx_t_ {
     struct srtp_stream_ctx_t_ *stream_template; /* act as template for other  */
                                                 /* streams                    */
     void *user_data;                            /* user custom data           */
+    srtp_nonce_stash_t nonce_stash[SRTP_NONCE_STASH_LEN];
+    size_t nonce_stash_clock;
 } srtp_ctx_t_;
 
 /*

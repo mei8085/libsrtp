@@ -71,6 +71,28 @@ srtp_err_status_t srtp_key_limit_clone(srtp_key_limit_t original,
     return srtp_err_status_ok;
 }
 
+srtp_key_event_t srtp_key_limit_peek(const srtp_key_limit_ctx_t *key)
+{
+    srtp_xtd_seq_num_t remaining = key->num_left;
+
+    /*
+     * Mirror srtp_key_limit_update(): the event is computed from the value
+     * the counter would have after consuming one usage, but the counter is
+     * not changed.
+     */
+    if (remaining < 1) {
+        return srtp_key_event_hard_limit;
+    }
+    remaining--;
+    if (remaining >= soft_limit) {
+        return srtp_key_event_normal;
+    }
+    if (remaining < 1) {
+        return srtp_key_event_hard_limit;
+    }
+    return srtp_key_event_soft_limit;
+}
+
 srtp_key_event_t srtp_key_limit_update(srtp_key_limit_t key)
 {
     key->num_left--;

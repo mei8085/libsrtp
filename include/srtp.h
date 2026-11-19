@@ -548,6 +548,14 @@ srtp_err_status_t srtp_policy_set_window_size(srtp_policy_t policy,
  * @param policy policy handle.
  * @param allow true to allow repeat transmissions, false otherwise.
  *
+ * A repeat transmission would have to be protected with the same packet index
+ * as the original packet, which re-uses the AES-CM keystream and, for the AEAD
+ * profiles, the GCM nonce.  libSRTP therefore never re-uses a nonce: a sender
+ * that re-protects an index it has already used gets
+ * srtp_err_status_nonce_bad from srtp_protect() instead of a second ciphertext,
+ * so this flag no longer enables nonce-reusing retransmissions.  It is retained
+ * for source compatibility.
+ *
  * @return
  *    - srtp_err_status_ok if value was applied.
  *    - srtp_err_status_bad_param if policy is NULL.
@@ -756,10 +764,21 @@ srtp_err_status_t srtp_shutdown(void);
  * @return
  *    - srtp_err_status_ok            no problems
  *    - srtp_err_status_replay_fail   rtp sequence number was non-increasing
+ *    - srtp_err_status_nonce_bad     the packet index would re-use a nonce
+ *                                    already derived with this key (a
+ *                                    retransmission, or an index older than
+ *                                    the sender's used-nonce window)
  *    - srtp_err_status_buffer_small  the srtp buffer is too small for the SRTP
  * packet
  *    - srtp_err_status_direction_mismatch the stream is not a sender stream
  *    - @e other                 failure in cryptographic mechanisms
+ *
+ * The sender keeps a used-nonce history per key and per stream.  A packet that
+ * cannot be given a fresh nonce is refused with srtp_err_status_nonce_bad and
+ * leaves the session's sending state unchanged, so the packets that follow it
+ * are unaffected.  A new key starts a fresh nonce space; installing a key that
+ * this stream has already used resumes its history instead of treating it as
+ * new.
  */
 srtp_err_status_t srtp_protect(srtp_t ctx,
                                const uint8_t *rtp,

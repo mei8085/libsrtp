@@ -149,6 +149,8 @@ srtp_err_status_t srtp_test_set_sender_roc(void);
 
 srtp_err_status_t srtp_test_initial_indices(void);
 
+srtp_err_status_t srtp_test_nonce_guard(void);
+
 srtp_err_status_t srtp_test_cryptex_csrc_but_no_extension_header(void);
 srtp_err_status_t srtp_test_cryptex_disable(void);
 srtp_err_status_t srtp_test_cryptex_not_in_place_distinct_buffer(void);
@@ -994,6 +996,14 @@ int main(int argc, char *argv[])
 
         printf("testing srtp_test_initial_indices()...");
         if (srtp_test_initial_indices() == srtp_err_status_ok) {
+            printf("passed\n");
+        } else {
+            printf("failed\n");
+            exit(1);
+        }
+
+        printf("testing srtp_test_nonce_guard()...");
+        if (srtp_test_nonce_guard() == srtp_err_status_ok) {
             printf("passed\n");
         } else {
             printf("failed\n");
@@ -6896,6 +6906,131 @@ srtp_err_status_t srtp_test_initial_indices(void)
     srtp_policy_destroy(policy);
     srtp_policy_destroy(updated);
 
+    return srtp_err_status_ok;
+}
+
+/*
+ * srtp_test_nonce_guard() verifies that a sender never derives the same nonce
+ * twice with one key:
+ *  - protecting the same packet index again fails with nonce_bad, even when
+ *    allow_repeat_tx is enabled;
+ *  - a sequence-number roll-over (which advances the index past the old one)
+ *    is still accepted;
+ *  - a failed send (a too-small output buffer) does not consume the nonce or
+ *    the key budget, so the same index succeeds afterwards;
+ *  - re-keying starts a fresh nonce space, while re-installing a key this
+ *    stream already used resumes its history and is refused.
+ * Every case is checked for both the AES-CM/HMAC profile and, when built in,
+ * the AES-GCM profile.
+ */
+static srtp_err_status_t nonce_guard_roundtrip(srtp_profile_t profile,
+                                               const uint8_t *key,
+                                               srtp_profile_t profile2,
+                                               const uint8_t *key2)
+{
+    const uint32_t ssrc = 0x4e4f4e43; /* "NONC" */
+    srtp_policy_t policy;
+    srtp_policy_t updated;
+    srtp_t session;
+    size_t len;
+    uint8_t *pkt;
+
+    /* repeat transmissions are refused, not honoured by re-using a nonce */
+    CHECK_OK(srtp_policy_create(&policy));
+    CHECK_OK(srtp_policy_set_profile(policy, profile));
+    CHECK_OK(policy_set_key(policy, key));
+    CHECK_OK(
+        srtp_policy_set_ssrc(policy, (srtp_ssrc_t){ ssrc_specific, ssrc }));
+    CHECK_OK(srtp_policy_set_allow_repeat_tx(policy, true));
+    CHECK_OK(srtp_create(&session, policy));
+
+    CHECK_OK(protect_rtp_seq(session, ssrc, 100));
+    CHECK_RETURN(protect_rtp_seq(session, ssrc, 100),
+                 srtp_err_status_nonce_bad);
+    CHECK_OK(protect_rtp_seq(session, ssrc, 101));
+
+    /* a roll-over advances the index and is accepted; its repeat is refused */
+    CHECK_OK(protect_rtp_seq(session, ssrc, 65535));
+    CHECK_OK(protect_rtp_seq(session, ssrc, 0));
+    CHECK_RETURN(protect_rtp_seq(session, ssrc, 0), srtp_err_status_nonce_bad);
+
+    /* a failed send must not consume the nonce for the index */
+    pkt = create_rtp_test_packet(32, ssrc, 200, 0, false, &len, NULL);
+    if (pkt == NULL) {
+        return srtp_err_status_alloc_fail;
+    }
+    {
+        size_t small = 8;
+        CHECK_RETURN(srtp_protect(session, pkt, len, pkt, &small, 0),
+                     srtp_err_status_buffer_small);
+    }
+    CHECK_OK(call_srtp_protect(session, pkt, &len, 0));
+    free(pkt);
+    /* and the stream keeps working normally afterwards */
+    CHECK_OK(protect_rtp_seq(session, ssrc, 201));
+    srtp_dealloc(session);
+    srtp_policy_destroy(policy);
+
+    /* re-keying opens a fresh nonce space for the same index */
+    CHECK_OK(srtp_policy_create(&policy));
+    CHECK_OK(srtp_policy_set_profile(policy, profile));
+    CHECK_OK(policy_set_key(policy, key));
+    CHECK_OK(
+        srtp_policy_set_ssrc(policy, (srtp_ssrc_t){ ssrc_specific, ssrc }));
+    CHECK_OK(srtp_policy_set_allow_repeat_tx(policy, true));
+    CHECK_OK(srtp_create(&session, policy));
+    CHECK_OK(protect_rtp_seq(session, ssrc, 7));
+
+    /*
+     * allow_repeat_tx is set so that the replay database does not mask the
+     * nonce guard: a repeated index reaches the guard, which is what the rest
+     * of this test exercises.
+     */
+    CHECK_OK(srtp_policy_create(&updated));
+    CHECK_OK(srtp_policy_set_profile(updated, profile2));
+    CHECK_OK(policy_set_key(updated, key2));
+    CHECK_OK(
+        srtp_policy_set_ssrc(updated, (srtp_ssrc_t){ ssrc_specific, ssrc }));
+    CHECK_OK(srtp_policy_set_allow_repeat_tx(updated, true));
+    CHECK_OK(srtp_update(session, updated));
+
+    /* the new key can use an index the old key already used */
+    CHECK_OK(protect_rtp_seq(session, ssrc, 7));
+    CHECK_RETURN(protect_rtp_seq(session, ssrc, 7), srtp_err_status_nonce_bad);
+
+    /* re-installing the old key must resume its history, not look "new" */
+    CHECK_OK(srtp_policy_set_profile(updated, profile));
+    CHECK_OK(policy_set_key(updated, key));
+    CHECK_OK(srtp_update(session, updated));
+    CHECK_RETURN(protect_rtp_seq(session, ssrc, 7), srtp_err_status_nonce_bad);
+    /* an index the old key never used is still fresh */
+    CHECK_OK(protect_rtp_seq(session, ssrc, 8));
+
+    srtp_dealloc(session);
+    srtp_policy_destroy(policy);
+    srtp_policy_destroy(updated);
+
+    return srtp_err_status_ok;
+}
+
+srtp_err_status_t srtp_test_nonce_guard(void)
+{
+    CHECK_OK(nonce_guard_roundtrip(srtp_profile_aes128_cm_sha1_80, test_key,
+                                   srtp_profile_aes128_cm_sha1_80,
+                                   test_alt_key));
+#ifdef HAVE_GCM
+    {
+        /* a distinct GCM key so the re-key really starts a fresh nonce space */
+        uint8_t gcm_key2[28];
+        memcpy(gcm_key2, test_key_gcm, sizeof(gcm_key2));
+        gcm_key2[0] ^= 0x5a;
+        gcm_key2[16] ^= 0xa5;
+        CHECK_OK(nonce_guard_roundtrip(srtp_profile_aead_aes_128_gcm,
+                                       test_key_gcm,
+                                       srtp_profile_aead_aes_128_gcm,
+                                       gcm_key2));
+    }
+#endif
     return srtp_err_status_ok;
 }
 

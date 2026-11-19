@@ -79,6 +79,15 @@ typedef struct srtp_key_limit_ctx_t {
     srtp_key_state_t state;
 } srtp_key_limit_ctx_t;
 
+/*
+ * srtp_key_limit_peek(key) reports the event that srtp_key_limit_update()
+ * would return, without consuming any key usage.  A sender can use it to
+ * refuse a packet that would exceed the hard limit before doing any work, and
+ * only commit the usage (with srtp_key_limit_update()) once the packet has
+ * actually been protected, so that a failed send does not consume budget.
+ */
+srtp_key_event_t srtp_key_limit_peek(const srtp_key_limit_ctx_t *key);
+
 #ifdef __cplusplus
 }
 #endif

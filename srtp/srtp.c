@@ -90,6 +90,14 @@ static const uint16_t xtn_hdr_two_byte_profile = 0x1000;
 static const uint16_t cryptex_one_byte_profile = 0xc0de;
 static const uint16_t cryptex_two_byte_profile = 0xc2de;
 
+/*
+ * Nonce-guard helpers are defined further down, next to the packet
+ * protection code; the stream initialisation needs the key fingerprint.
+ */
+static void srtp_nonce_key_fingerprint(const uint8_t *key,
+                                       size_t key_len,
+                                       uint8_t out[SRTP_KEY_EPOCH_LEN]);
+
 static size_t srtp_get_rtp_hdr_len(const srtp_hdr_t *hdr)
 {
     return octets_in_rtp_header + 4 * hdr->cc;
@@ -827,6 +835,10 @@ static srtp_err_status_t srtp_stream_clone(
         memcpy(session_keys->c_salt, template_session_keys->c_salt,
                SRTP_AEAD_SALT_LEN);
 
+        /* the clone shares the template's derived key material */
+        memcpy(session_keys->epoch_id, template_session_keys->epoch_id,
+               SRTP_KEY_EPOCH_LEN);
+
         /* set key limit to point to that of the template */
         status = srtp_key_limit_clone(template_session_keys->limit,
                                       &session_keys->limit);
@@ -1395,6 +1407,14 @@ srtp_err_status_t srtp_stream_init_keys(srtp_session_keys_t *session_keys,
         octet_string_set_to_zero(tmp_key, MAX_SRTP_KEY_LEN);
         return srtp_err_status_init_fail;
     }
+
+    /*
+     * Fingerprint the derived RTP key material (key followed by salt) so the
+     * nonce guard can tell one key epoch from another.  A new key yields a
+     * fresh nonce space; re-installing the same key reproduces the
+     * fingerprint and resumes that key's used-nonce history.
+     */
+    srtp_nonce_key_fingerprint(tmp_key, rtp_keylen, session_keys->epoch_id);
 
     if (session_keys->rtp_xtn_hdr_cipher) {
         /* generate extensions header encryption key  */
@@ -2149,6 +2169,391 @@ static srtp_err_status_t srtp_get_est_pkt_index(const srtp_hdr_t *hdr,
 }
 
 /*
+ * Sending-direction nonce guard
+ *
+ * An SRTP nonce is a function of the session key and of the packet index: the
+ * AES-CM profiles build it from the SSRC and the 48-bit index, and the AEAD
+ * profile builds the GCM IV from the SSRC, the ROC and the sequence number,
+ * salted with the session key.  Deriving two nonces from the same key, index
+ * and SSRC therefore re-uses the keystream (AES-CM) or the GCM nonce, which is
+ * catastrophic for both ciphers.
+ *
+ * The guard below binds the packet index and the key epoch to the nonces that
+ * have actually been used on a stream:
+ *
+ *  - each key epoch (identified by a fingerprint of its derived RTP key
+ *    material) keeps the used index window ending at the highest index it has
+ *    protected; any index whose bit is set has consumed its nonce,
+ *  - a repeated index is refused with srtp_err_status_nonce_bad instead of
+ *    re-using the nonce; the retransmission protection that allow_repeat_tx
+ *    provides is inherently nonce-reusing and cannot be honoured safely,
+ *  - a sequence-number roll-over produces a larger index and is accepted, so
+ *    normal sends keep working,
+ *  - a new key starts a fresh nonce space, while a key that is installed again
+ *    resumes its recorded window; if an old key's history was evicted it is
+ *    remembered as stale and may not send at all, so it can never be mistaken
+ *    for a new key,
+ *  - the guard is updated only after the packet was protected successfully, so
+ *    a failed send leaves later sends of the same stream unaffected.
+ */
+
+#define SRTP_NONCE_BIT(index, high)                                            \
+    ((size_t)((high) - (index)))
+
+static size_t srtp_nonce_window_words(void)
+{
+    return SRTP_NONCE_WINDOW_WORDS;
+}
+
+static void srtp_nonce_window_clear(srtp_nonce_epoch_t *epoch)
+{
+    memset(epoch->used, 0, sizeof(epoch->used));
+}
+
+/* Mark index as used; the caller has ensured index is within the window. */
+static void srtp_nonce_window_set(srtp_nonce_epoch_t *epoch,
+                                  srtp_xtd_seq_num_t index)
+{
+    size_t bit = SRTP_NONCE_BIT(index, epoch->high);
+
+    epoch->used[bit >> 5] |= (uint32_t)1 << (bit & 31);
+}
+
+static bool srtp_nonce_window_test(const srtp_nonce_epoch_t *epoch,
+                                   srtp_xtd_seq_num_t index)
+{
+    size_t bit = SRTP_NONCE_BIT(index, epoch->high);
+
+    return (epoch->used[bit >> 5] & ((uint32_t)1 << (bit & 31))) != 0;
+}
+
+/*
+ * Advance the window to a new, higher high-water mark, shifting the recorded
+ * indices up and clearing the newly opened (unused) indices.  Shifting by at
+ * least the window size simply clears the window.
+ */
+static void srtp_nonce_window_advance(srtp_nonce_epoch_t *epoch,
+                                      srtp_xtd_seq_num_t index)
+{
+    size_t shift = (size_t)(index - epoch->high);
+    const size_t words = srtp_nonce_window_words();
+
+    if (shift >= SRTP_NONCE_WINDOW) {
+        srtp_nonce_window_clear(epoch);
+    } else {
+        /* carry the old bits up by "shift", discarding those shifted out */
+        size_t word_shift = shift >> 5;
+        size_t bit_shift = shift & 31;
+
+        for (size_t i = words; i-- > 0;) {
+            uint32_t lo = 0;
+            uint32_t hi = 0;
+
+            if (i >= word_shift) {
+                lo = epoch->used[i - word_shift];
+            }
+            if (bit_shift && i >= word_shift + 1) {
+                hi = epoch->used[i - word_shift - 1];
+            }
+            epoch->used[i] =
+                bit_shift ? (lo << bit_shift) | (hi >> (32 - bit_shift)) : lo;
+        }
+    }
+
+    /* the new high-water mark itself is now used (bit 0 of the window) */
+    epoch->high = index;
+    srtp_nonce_window_set(epoch, index);
+}
+
+static bool srtp_nonce_epoch_matches(const srtp_nonce_epoch_t *epoch,
+                                     const uint8_t id[SRTP_KEY_EPOCH_LEN])
+{
+    return epoch->valid &&
+           memcmp(epoch->epoch_id, id, SRTP_KEY_EPOCH_LEN) == 0;
+}
+
+static bool srtp_nonce_epoch_is_stale(const srtp_nonce_guard_t *guard,
+                                      const uint8_t id[SRTP_KEY_EPOCH_LEN])
+{
+    for (size_t i = 0; i < guard->stale_count; i++) {
+        if (memcmp(guard->stale_id[i], id, SRTP_KEY_EPOCH_LEN) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void srtp_nonce_remember_stale(srtp_nonce_guard_t *guard,
+                                      const uint8_t id[SRTP_KEY_EPOCH_LEN])
+{
+    size_t slot = guard->stale_count;
+
+    if (slot >= SRTP_NONCE_STALE_LEN) {
+        /*
+         * The stale set is full.  Drop the oldest fingerprint; losing it only
+         * weakens the "old key is not new key" check for a key that was
+         * already evicted twice, never for a live one.
+         */
+        memmove(guard->stale_id[0], guard->stale_id[1],
+                (SRTP_NONCE_STALE_LEN - 1) * SRTP_KEY_EPOCH_LEN);
+        slot = SRTP_NONCE_STALE_LEN - 1;
+    } else {
+        guard->stale_count++;
+    }
+    memcpy(guard->stale_id[slot], id, SRTP_KEY_EPOCH_LEN);
+}
+
+/*
+ * Find the epoch record for key fingerprint "id", or allocate one.  When all
+ * slots are in use the least recently used epoch is evicted, and its
+ * fingerprint is remembered as stale so that re-enabling that key cannot be
+ * mistaken for installing a new one.
+ */
+static srtp_nonce_epoch_t *srtp_nonce_epoch_get(
+    srtp_nonce_guard_t *guard,
+    const uint8_t id[SRTP_KEY_EPOCH_LEN])
+{
+    srtp_nonce_epoch_t *free_slot = NULL;
+    srtp_nonce_epoch_t *lru = NULL;
+
+    for (size_t i = 0; i < SRTP_NONCE_EPOCHS; i++) {
+        srtp_nonce_epoch_t *epoch = &guard->epoch[i];
+
+        if (srtp_nonce_epoch_matches(epoch, id)) {
+            return epoch;
+        }
+        if (!epoch->valid) {
+            if (free_slot == NULL) {
+                free_slot = epoch;
+            }
+        } else if (lru == NULL || epoch->last_used < lru->last_used) {
+            lru = epoch;
+        }
+    }
+
+    /*
+     * Prefer an unused slot; evict the least recently used epoch only when
+     * every slot is taken.  An evicted epoch's fingerprint is remembered as
+     * stale so that re-enabling that key cannot be mistaken for a new one.
+     */
+    srtp_nonce_epoch_t *victim = free_slot != NULL ? free_slot : lru;
+
+    if (victim->valid) {
+        srtp_nonce_remember_stale(guard, victim->epoch_id);
+    }
+    memset(victim, 0, sizeof(*victim));
+    victim->valid = true;
+    memcpy(victim->epoch_id, id, SRTP_KEY_EPOCH_LEN);
+
+    return victim;
+}
+
+/*
+ * Decide whether the nonce for (epoch, index) may be used, without changing
+ * any state.  *epoch_out is the recorded history for this key, or NULL when
+ * the key has no history yet (in which case every index is fresh).  Returns
+ * srtp_err_status_ok when the sender may go ahead, srtp_err_status_nonce_bad
+ * when the nonce was already used (or belongs to an evicted key epoch) and
+ * srtp_err_status_key_expired when the index no longer fits the 48-bit packet
+ * index space.
+ *
+ * The check is deliberately side-effect free: allocating or evicting an epoch
+ * slot here would let a send that later fails disturb the history of another
+ * key, which the ordering of the calls in srtp_protect() would then turn into a
+ * spurious refusal of a later packet.  Allocation happens in
+ * srtp_nonce_guard_commit() instead.
+ */
+static srtp_err_status_t srtp_nonce_guard_check(
+    srtp_nonce_guard_t *guard,
+    const uint8_t id[SRTP_KEY_EPOCH_LEN],
+    srtp_xtd_seq_num_t index,
+    srtp_nonce_epoch_t **epoch_out)
+{
+    *epoch_out = NULL;
+
+    if (index > UINT64_C(0xffffffffffff)) {
+        return srtp_err_status_key_expired;
+    }
+
+    if (srtp_nonce_epoch_is_stale(guard, id)) {
+        /*
+         * This key's history was evicted because newer keys pushed it out.
+         * Treat it as used: sending with it again could repeat a nonce the
+         * guard no longer remembers.
+         */
+        return srtp_err_status_nonce_bad;
+    }
+
+    for (size_t i = 0; i < SRTP_NONCE_EPOCHS; i++) {
+        srtp_nonce_epoch_t *epoch = &guard->epoch[i];
+
+        if (!srtp_nonce_epoch_matches(epoch, id)) {
+            continue;
+        }
+        if (epoch->started) {
+            if (index > epoch->high) {
+                /* a new, higher index: its nonce is fresh */
+            } else if (epoch->high - index >= SRTP_NONCE_WINDOW) {
+                /*
+                 * Older than anything the window can prove unused.  Refuse it
+                 * rather than risk repeating a nonce.
+                 */
+                return srtp_err_status_nonce_bad;
+            } else if (srtp_nonce_window_test(epoch, index)) {
+                return srtp_err_status_nonce_bad;
+            }
+        }
+        *epoch_out = epoch;
+        return srtp_err_status_ok;
+    }
+
+    /* no history for this key yet: the nonce is fresh */
+    return srtp_err_status_ok;
+}
+
+/* Commit a successfully protected packet to the guard. */
+static void srtp_nonce_guard_commit(srtp_nonce_guard_t *guard,
+                                    srtp_nonce_epoch_t *epoch,
+                                    const uint8_t id[SRTP_KEY_EPOCH_LEN],
+                                    srtp_xtd_seq_num_t index)
+{
+    if (epoch == NULL) {
+        epoch = srtp_nonce_epoch_get(guard, id);
+    }
+
+    if (!epoch->started) {
+        epoch->started = true;
+        epoch->high = index;
+        srtp_nonce_window_clear(epoch);
+        srtp_nonce_window_set(epoch, index);
+    } else if (index > epoch->high) {
+        srtp_nonce_window_advance(epoch, index);
+    } else {
+        srtp_nonce_window_set(epoch, index);
+    }
+    epoch->last_used = ++guard->clock;
+}
+
+/*
+ * Compute the fingerprint of the derived RTP key material for a session key
+ * slot.  It covers every octet of the derived base key and salt, so it changes
+ * exactly when the nonce space changes: a re-key with different material
+ * yields a different fingerprint, while re-installing the same key reproduces
+ * it so that the guard resumes that key's history.
+ *
+ * The fingerprint is a deterministic 160-bit fold of the key material.  It is
+ * not a secret: it is compared only against material this process itself
+ * derived, and a collision can at worst refuse a packet (the history of another
+ * key is resumed), never allow a nonce to be repeated with a different cipher
+ * key.
+ */
+static void srtp_nonce_key_fingerprint(const uint8_t *key,
+                                       size_t key_len,
+                                       uint8_t out[SRTP_KEY_EPOCH_LEN])
+{
+    uint32_t h[5] = { 0x9e3779b9u, 0x85ebca6bu, 0xc2b2ae35u, 0x27d4eb2fu,
+                      0x165667b1u };
+
+    /* FNV-style mixing, rotating the state words so every octet counts */
+    for (size_t i = 0; i < key_len; i++) {
+        uint32_t v = h[i % 5] ^ (uint32_t)key[i];
+        v *= 16777619u;
+        h[i % 5] = (v << 13) | (v >> 19);
+    }
+
+    /* final avalanche, so one changed octet spreads over the whole result */
+    for (int round = 0; round < 3; round++) {
+        for (size_t j = 0; j < 5; j++) {
+            uint32_t v = h[j];
+            v ^= h[(j + 1) % 5] + 0x9e3779b9u + (v << 6) + (v >> 2);
+            h[j] = v;
+        }
+    }
+
+    /* serialise little-endian so the fingerprint is platform-independent */
+    for (size_t j = 0; j < 5; j++) {
+        out[4 * j + 0] = (uint8_t)(h[j]);
+        out[4 * j + 1] = (uint8_t)(h[j] >> 8);
+        out[4 * j + 2] = (uint8_t)(h[j] >> 16);
+        out[4 * j + 3] = (uint8_t)(h[j] >> 24);
+    }
+}
+
+static bool srtp_nonce_guard_has_history(const srtp_nonce_guard_t *guard)
+{
+    return guard->clock != 0 || guard->stale_count != 0;
+}
+
+/*
+ * Only ciphers that derive a nonce from the packet index need the guard.  The
+ * null cipher produces no keystream and no AEAD nonce, so repeating an index
+ * discloses nothing; leaving it unguarded keeps the historical behaviour of
+ * the null/null profile (which has no key at all).
+ */
+static bool srtp_nonce_guard_applies(const srtp_session_keys_t *session_keys)
+{
+    return session_keys->rtp_cipher->type->id != SRTP_NULL_CIPHER;
+}
+
+/*
+ * Move the nonce guard of a stream that is about to be rebuilt (re-keyed or
+ * removed and re-added) into the session's stash, keyed by SSRC.  The guard of
+ * an already stashed entry for the same SSRC is replaced, and the least
+ * recently used entry is recycled when the stash is full.  This keeps the
+ * used-nonce history reachable across the rebuild so that a stream cannot
+ * silently start a fresh nonce space for a key it has already used.
+ */
+static void srtp_nonce_stash_put(srtp_ctx_t *ctx,
+                                 uint32_t ssrc,
+                                 srtp_nonce_guard_t *guard)
+{
+    srtp_nonce_stash_t *free_slot = NULL;
+    srtp_nonce_stash_t *lru = NULL;
+    srtp_nonce_stash_t *match = NULL;
+
+    for (size_t i = 0; i < SRTP_NONCE_STASH_LEN; i++) {
+        srtp_nonce_stash_t *slot = &ctx->nonce_stash[i];
+
+        if (!slot->valid) {
+            if (free_slot == NULL) {
+                free_slot = slot;
+            }
+        } else if (slot->ssrc == ssrc) {
+            match = slot;
+        } else if (lru == NULL || slot->guard.clock < lru->guard.clock) {
+            lru = slot;
+        }
+    }
+
+    srtp_nonce_stash_t *victim =
+        match != NULL ? match : (free_slot != NULL ? free_slot : lru);
+
+    victim->valid = true;
+    victim->ssrc = ssrc;
+    victim->guard = *guard;
+    /* mark as the most recently used stash entry */
+    victim->guard.clock = ++ctx->nonce_stash_clock;
+    memset(guard, 0, sizeof(*guard));
+}
+
+/*
+ * Take back a stashed nonce guard for a freshly built stream, if one exists.
+ * The stream keeps the history of the same SSRC's previous incarnation, which
+ * is what stops an old key from being accepted as a new one after a rebuild.
+ */
+static void srtp_nonce_stash_take(srtp_ctx_t *ctx, srtp_stream_ctx_t *stream)
+{
+    for (size_t i = 0; i < SRTP_NONCE_STASH_LEN; i++) {
+        srtp_nonce_stash_t *slot = &ctx->nonce_stash[i];
+        if (slot->valid && slot->ssrc == stream->ssrc) {
+            stream->nonce_guard = slot->guard;
+            memset(slot, 0, sizeof(*slot));
+            return;
+        }
+    }
+}
+
+/*
  * This function handles outgoing SRTP packets while in AEAD mode,
  * which currently supports AES-GCM encryption.  All packets are
  * encrypted and authenticated.
@@ -2165,6 +2570,7 @@ static srtp_err_status_t srtp_protect_aead(srtp_ctx_t *ctx,
     size_t enc_start;         /* offset to start of encrypted portion   */
     size_t enc_octet_len = 0; /* number of octets in encrypted portion  */
     srtp_xtd_seq_num_t est;   /* estimated xtd_seq_num_t of *hdr        */
+    srtp_xtd_seq_num_t pkt_index; /* packet index as estimated, unshifted */
     ssize_t delta;            /* delta of local pkt idx and that in hdr */
     srtp_err_status_t status;
     size_t tag_len;
@@ -2172,23 +2578,26 @@ static srtp_err_status_t srtp_protect_aead(srtp_ctx_t *ctx,
     size_t aad_len;
     size_t rcc_extra = 0; /* octets of ROC appended for RFC 4771 mode 3   */
     uint32_t rcc_roc = 0; /* sender's ROC carried on ROC-carrying packets */
+    srtp_nonce_epoch_t *nonce_epoch = NULL;
+    bool advance_packet_index = false;
 
     debug_print0(mod_srtp, "function srtp_protect_aead");
 
     /*
-     * update the key usage limit, and check it to make sure that we
-     * didn't just hit either the soft limit or the hard limit, and call
-     * the event handler if we hit either.
+     * Check the key usage limit without consuming any budget: the usage is
+     * committed only once the packet has actually been protected, so that a
+     * failed send cannot exhaust the key on behalf of later packets.
      */
-    switch (srtp_key_limit_update(session_keys->limit)) {
+    switch (srtp_key_limit_peek(session_keys->limit)) {
     case srtp_key_event_normal:
         break;
     case srtp_key_event_hard_limit:
         srtp_handle_event(ctx, stream, event_key_hard_limit);
         return srtp_err_status_key_expired;
     case srtp_key_event_soft_limit:
-    default:
         srtp_handle_event(ctx, stream, event_key_soft_limit);
+        break;
+    default:
         break;
     }
 
@@ -2258,11 +2667,10 @@ static srtp_err_status_t srtp_protect_aead(srtp_ctx_t *ctx,
         return status;
     }
 
+    pkt_index = est;
+
     if (status == srtp_err_status_pkt_idx_adv) {
-        srtp_rdbx_set_roc_seq(&stream->rtp_rdbx, (uint32_t)(est >> 16),
-                              (uint16_t)(est & 0xFFFF));
-        stream->pending_roc = 0;
-        srtp_rdbx_add_index(&stream->rtp_rdbx, 0);
+        advance_packet_index = true;
     } else {
         status = srtp_rdbx_check(&stream->rtp_rdbx, delta);
         if (status) {
@@ -2270,8 +2678,23 @@ static srtp_err_status_t srtp_protect_aead(srtp_ctx_t *ctx,
                 !stream->allow_repeat_tx)
                 return status; /* we've been asked to reuse an index */
         }
-        srtp_rdbx_add_index(&stream->rtp_rdbx, delta);
-        stream->pending_roc = 0;
+    }
+
+    /*
+     * Refuse to derive a nonce that has already been used with this key:
+     * re-protecting an index would repeat the keystream and, for the AEAD
+     * profile, the GCM nonce.  The guard is only inspected here, so a
+     * refusal leaves the stream exactly where it was.  This replaces the
+     * nonce-reusing retransmission behaviour that allow_repeat_tx used to
+     * enable.
+     */
+    if (srtp_nonce_guard_applies(session_keys)) {
+        status = srtp_nonce_guard_check(&stream->nonce_guard,
+                                        session_keys->epoch_id, pkt_index,
+                                        &nonce_epoch);
+        if (status) {
+            return status;
+        }
     }
 
     debug_print(mod_srtp, "estimated packet index: %016" PRIx64, est);
@@ -2358,6 +2781,42 @@ static srtp_err_status_t srtp_protect_aead(srtp_ctx_t *ctx,
         uint32_t roc_net = htonl(rcc_roc);
         memcpy(srtp + *srtp_len, &roc_net, sizeof(roc_net));
         *srtp_len += rcc_extra;
+    }
+
+    /*
+     * The packet has been protected successfully, so it is now safe to
+     * commit the packet index, the key usage and the used nonce.  Doing this
+     * only now means that any earlier failure return left the stream's
+     * sending state - and its nonce guard - untouched.
+     */
+    if (advance_packet_index) {
+        srtp_rdbx_set_roc_seq(&stream->rtp_rdbx, (uint32_t)(pkt_index >> 16),
+                              (uint16_t)(pkt_index & 0xFFFF));
+        srtp_rdbx_add_index(&stream->rtp_rdbx, 0);
+    } else {
+        srtp_rdbx_add_index(&stream->rtp_rdbx, delta);
+    }
+    stream->pending_roc = 0;
+
+    if (srtp_nonce_guard_applies(session_keys)) {
+        srtp_nonce_guard_commit(&stream->nonce_guard, nonce_epoch,
+                                session_keys->epoch_id, pkt_index);
+    }
+
+    /*
+     * Commit one unit of key usage now that the packet has been sent.  The
+     * peek above has already ruled out the hard limit, so only a soft-limit
+     * crossing can be reported here.
+     */
+    switch (srtp_key_limit_update(session_keys->limit)) {
+    case srtp_key_event_soft_limit:
+        srtp_handle_event(ctx, stream, event_key_soft_limit);
+        break;
+    case srtp_key_event_hard_limit:
+        srtp_handle_event(ctx, stream, event_key_hard_limit);
+        break;
+    default:
+        break;
     }
 
     return srtp_err_status_ok;
@@ -2656,6 +3115,7 @@ srtp_err_status_t srtp_protect(srtp_t ctx,
     uint8_t *auth_start;      /* pointer to start of auth. portion      */
     size_t enc_octet_len = 0; /* number of octets in encrypted portion  */
     srtp_xtd_seq_num_t est;   /* estimated xtd_seq_num_t of *hdr        */
+    srtp_xtd_seq_num_t pkt_index; /* packet index as estimated, unshifted */
     ssize_t delta;            /* delta of local pkt idx and that in hdr */
     uint8_t *auth_tag = NULL; /* location of auth_tag within packet     */
     srtp_err_status_t status;
@@ -2665,6 +3125,8 @@ srtp_err_status_t srtp_protect(srtp_t ctx,
     srtp_session_keys_t *session_keys = NULL;
     bool rcc_carry;     /* whether this packet carries the ROC (RFC 4771) */
     size_t rcc_tag_len; /* number of tag octets actually appended         */
+    srtp_nonce_epoch_t *nonce_epoch = NULL;
+    bool advance_packet_index = false;
 
     debug_print0(mod_srtp, "function srtp_protect");
 
@@ -2701,6 +3163,9 @@ srtp_err_status_t srtp_protect(srtp_t ctx,
             if (status) {
                 return status;
             }
+
+            /* carry over any used-nonce history for this SSRC */
+            srtp_nonce_stash_take(ctx, new_stream);
 
             /* add new stream to the list */
             status = srtp_insert_or_dealloc_stream(ctx->stream_list, new_stream,
@@ -2754,9 +3219,10 @@ srtp_err_status_t srtp_protect(srtp_t ctx,
     /*
      * update the key usage limit, and check it to make sure that we
      * didn't just hit either the soft limit or the hard limit, and call
-     * the event handler if we hit either.
+     * the event handler if we hit either.  The usage is only committed once
+     * the packet has been protected, so a failed send does not consume it.
      */
-    switch (srtp_key_limit_update(session_keys->limit)) {
+    switch (srtp_key_limit_peek(session_keys->limit)) {
     case srtp_key_event_normal:
         break;
     case srtp_key_event_soft_limit:
@@ -2843,11 +3309,10 @@ srtp_err_status_t srtp_protect(srtp_t ctx,
         return status;
     }
 
+    pkt_index = est;
+
     if (status == srtp_err_status_pkt_idx_adv) {
-        srtp_rdbx_set_roc_seq(&stream->rtp_rdbx, (uint32_t)(est >> 16),
-                              (uint16_t)(est & 0xFFFF));
-        stream->pending_roc = 0;
-        srtp_rdbx_add_index(&stream->rtp_rdbx, 0);
+        advance_packet_index = true;
     } else {
         status = srtp_rdbx_check(&stream->rtp_rdbx, delta);
         if (status) {
@@ -2855,8 +3320,21 @@ srtp_err_status_t srtp_protect(srtp_t ctx,
                 !stream->allow_repeat_tx)
                 return status; /* we've been asked to reuse an index */
         }
-        srtp_rdbx_add_index(&stream->rtp_rdbx, delta);
-        stream->pending_roc = 0;
+    }
+
+    /*
+     * Refuse to derive a nonce that has already been used with this key.
+     * Re-protecting an index repeats the AES-CM keystream; allow_repeat_tx
+     * cannot be honoured safely and is superseded by this check.  The guard is
+     * only read here, so a refusal leaves the stream's sending state intact.
+     */
+    if (srtp_nonce_guard_applies(session_keys)) {
+        status = srtp_nonce_guard_check(&stream->nonce_guard,
+                                        session_keys->epoch_id, pkt_index,
+                                        &nonce_epoch);
+        if (status) {
+            return status;
+        }
     }
 
     debug_print(mod_srtp, "estimated packet index: %016" PRIx64, est);
@@ -3001,6 +3479,42 @@ srtp_err_status_t srtp_protect(srtp_t ctx,
 
     /* increate the packet length by the mki size if used */
     *srtp_len += stream->mki_size;
+
+    /*
+     * The packet has been protected successfully, so commit the packet index,
+     * the used nonce and the key usage.  Committing only now keeps the
+     * sending state unchanged for every earlier failure return, so a rejected
+     * packet never disturbs the packets that follow it.
+     */
+    if (advance_packet_index) {
+        srtp_rdbx_set_roc_seq(&stream->rtp_rdbx, (uint32_t)(pkt_index >> 16),
+                              (uint16_t)(pkt_index & 0xFFFF));
+        srtp_rdbx_add_index(&stream->rtp_rdbx, 0);
+    } else {
+        srtp_rdbx_add_index(&stream->rtp_rdbx, delta);
+    }
+    stream->pending_roc = 0;
+
+    if (srtp_nonce_guard_applies(session_keys)) {
+        srtp_nonce_guard_commit(&stream->nonce_guard, nonce_epoch,
+                                session_keys->epoch_id, pkt_index);
+    }
+
+    /*
+     * Commit one unit of key usage now that the packet has been sent.  The
+     * peek above has already ruled out the hard limit, so only a soft-limit
+     * crossing can be reported here.
+     */
+    switch (srtp_key_limit_update(session_keys->limit)) {
+    case srtp_key_event_soft_limit:
+        srtp_handle_event(ctx, stream, event_key_soft_limit);
+        break;
+    case srtp_key_event_hard_limit:
+        srtp_handle_event(ctx, stream, event_key_hard_limit);
+        break;
+    default:
+        break;
+    }
 
     return srtp_err_status_ok;
 }
@@ -3571,6 +4085,11 @@ srtp_err_status_t srtp_stream_add(srtp_t session, const srtp_policy_t policy)
         session->stream_template->direction = dir_srtp_receiver;
         break;
     case (ssrc_specific):
+        /*
+         * A stream added for an SSRC that was removed earlier resumes that
+         * SSRC's used-nonce history, so that its keys are not treated as new.
+         */
+        srtp_nonce_stash_take(session, tmp);
         status = srtp_insert_or_dealloc_stream(session->stream_list, tmp,
                                                session->stream_template);
         if (status) {
@@ -3659,6 +4178,16 @@ srtp_err_status_t srtp_stream_remove(srtp_t session, uint32_t ssrc)
 
     srtp_stream_list_remove(session->stream_list, stream);
 
+    /*
+     * Retain the used-nonce history of the outgoing stream, so that removing
+     * and re-adding this SSRC - or re-adding it with the same key - cannot
+     * silently reset the nonce space.  It is reclaimed if a stream for this
+     * SSRC is created again and dropped once the stash recycles it.
+     */
+    if (srtp_nonce_guard_has_history(&stream->nonce_guard)) {
+        srtp_nonce_stash_put(session, stream->ssrc, &stream->nonce_guard);
+    }
+
     /* deallocate the stream */
     status = srtp_stream_dealloc(stream, session->stream_template);
     if (status) {
@@ -3740,6 +4269,9 @@ static bool update_template_stream_cb(srtp_stream_t stream, void *raw_data)
     if (data->status) {
         return false;
     }
+
+    /* resume the used-nonce history the removed stream deposited */
+    srtp_nonce_stash_take(session, stream);
 
     /* add new stream to the head of the new_stream_list */
     data->status = srtp_insert_or_dealloc_stream(data->new_stream_list, stream,
@@ -3911,6 +4443,9 @@ static srtp_err_status_t stream_update(srtp_t session,
     if (stream == NULL) {
         return srtp_err_status_fail;
     }
+
+    /* resume the used-nonce history srtp_stream_remove() deposited */
+    srtp_nonce_stash_take(session, stream);
 
     /*
      * Restore the live index and replay bits. A starting index on the update
